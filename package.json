@@ -1,0 +1,10 @@
+{
+  "name": "voice-typer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Windows 全局语音输入：本地 SenseVoice 识别 + 全局快捷键 + 自动粘贴",
+  "dependencies": {
+    "sherpa-onnx-node": "^1.13.8"
+  }
+}

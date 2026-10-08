@@ -1,0 +1,65 @@
+voice-typer 第三方资源说明
+============================
+
+本程序使用的图标来自以下开源图标库，路径数据（SVG path）原样内嵌于 icons.ps1。
+渲染方式：由 WPF 的 System.Windows.Media.Geometry.Parse 解析 SVG 路径数据，
+          再经 RenderTargetBitmap 光栅化为位图，最后由 GDI+ 合成到悬浮按钮上。
+
+--------------------------------------------------------------------------------
+1. Google Material Symbols  ——  默认图标
+   图标名 : mic
+   来源   : https://fonts.google.com/icons
+   仓库   : https://github.com/google/material-design-icons
+   许可   : Apache License 2.0
+            http://www.apache.org/licenses/LICENSE-2.0
+
+--------------------------------------------------------------------------------
+2. Tabler Icons  ——  可选
+   图标名 : microphone (filled)
+   来源   : https://tabler.io/icons
+   仓库   : https://github.com/tabler/tabler-icons
+   许可   : MIT License
+            https://github.com/tabler/tabler-icons/blob/main/LICENSE
+
+--------------------------------------------------------------------------------
+3. Phosphor Icons  ——  可选
+   图标名 : microphone (fill)
+   来源   : https://phosphoricons.com
+   仓库   : https://github.com/phosphor-icons/core
+   许可   : MIT License
+            https://github.com/phosphor-icons/core/blob/main/LICENSE
+
+--------------------------------------------------------------------------------
+其他组件
+--------------------------------------------------------------------------------
+语音识别模型 SenseVoiceSmall
+   来源 : https://huggingface.co/FunAudioLLM/SenseVoiceSmall
+   部署 : https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17
+   许可 : 见模型仓库说明
+   本地 : %USERPROFILE%\.dsh\speech-to-text\sensevoice\models\sensevoice-onnx
+          （可用环境变量 VT_MODEL_DIR 指定到别处）
+
+语音识别模型 B：Qwen3-ASR-0.6B（可选引擎，设置里切换）
+   来源 : https://github.com/QwenLM/Qwen3-ASR
+   模型 : https://huggingface.co/Qwen/Qwen3-ASR-0.6B
+   部署 : https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
+          文件名 sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2
+   许可 : Apache License 2.0
+   本地 : voice-typer\models\sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25
+   能力 : 52 种语言 + 22 种中文方言；支持 hotwords 上下文偏置
+
+语音活动检测 (VAD)：Silero VAD
+   来源 : https://github.com/snakers4/silero-vad
+   说明 : 由 sherpa-onnx 的 SenseVoice 包一并提供，两个引擎共用
+
+sherpa-onnx 运行时
+   来源 : https://github.com/k2-fsa/sherpa-onnx
+   许可 : Apache License 2.0
+   Node 版  1.13.8 —— 用于 SenseVoice 引擎
+   Python 版 1.13.8 —— 用于 Qwen3-ASR 引擎，装在 .venv-qwen3 内（不污染系统 Python）
+
+文本纠错：DeepSeek API（deepseek-flash，非推理模式）
+   来源 : https://api-docs.deepseek.com
+   说明 : 仅在你开启「收尾 AI 校验」时调用。音频不出本机，只发送识别后的文字。
+
+NAudio  ——  已不再使用（早期版本用过，现已移除）

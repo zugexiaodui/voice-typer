@@ -1,0 +1,80 @@
+{
+  "_说明": "收尾 AI 校验的服务预设。设置界面和托盘菜单会把这些 name 列出来供选择。",
+  "_怎么加新来源": "在 presets 数组里复制一段改掉即可，改完保存，重开设置窗口就能看到。",
+  "_字段说明": {
+    "id": "唯一标识，随便起，不要重复",
+    "name": "显示名称，会出现在设置界面的下拉框和托盘的「后处理模型」菜单里",
+    "baseUrl": "服务地址。留空 = DeepSeek 官方 api.deepseek.com；也可以只填域名或 /v1，程序会按 apiFormat 自动补路径",
+    "apiFormat": "openai 或 anthropic",
+    "model": "模型名",
+    "keyName": "去 .dsh\\.credentials.yaml 的 refs: 段里读哪个密钥（这里只写名字，不写密钥本身）",
+    "maxTokens": "输出 token 下限。思考模式关不掉的来源要给 2048，否则正文会被思考吃光变成空",
+    "timeoutMs": "超时毫秒。思考模式来源建议 20000；普通对话模型 15000 够用",
+    "thinkParams": "关思考的参数发不发。deepseek = 发 reasoning_effort/thinking（DeepSeek 系专用）；none = 一个都不发（GPT / Claude 等，发了会被中转站卡死）",
+    "note": "界面上显示的说明文字"
+  },
+
+  "presets": [
+    {
+      "id": "deepseek-official",
+      "name": "DeepSeek 官方",
+      "baseUrl": "",
+      "apiFormat": "openai",
+      "model": "deepseek-flash",
+      "keyName": "DEEPSEEK_API_KEY",
+      "maxTokens": 2048,
+      "timeoutMs": 6000,
+      "thinkParams": "deepseek",
+      "note": "官方直连，最快（实测约 1.1 秒）。非推理模式，思维 token = 0"
+    },
+    {
+      "id": "deepseek-ikuncode",
+      "name": "DeepSeek - ikuncode",
+      "baseUrl": "https://api.ikuncode.ai",
+      "apiFormat": "anthropic",
+      "model": "deepseek-v4.1-flash",
+      "keyName": "IKUNCODE_API_KEY",
+      "maxTokens": 2048,
+      "timeoutMs": 20000,
+      "thinkParams": "deepseek",
+      "note": "中转站，便宜但慢 4~5 倍（实测约 4~6 秒）。思考模式关不掉，等久一点就好"
+    },
+
+    {
+      "id": "aizex-gpt-4o",
+      "name": "Aizex - GPT-4o",
+      "baseUrl": "https://aizex.top/v1",
+      "apiFormat": "openai",
+      "model": "gpt-4o",
+      "keyName": "AIZEX_API_KEY",
+      "maxTokens": 2048,
+      "timeoutMs": 15000,
+      "thinkParams": "none",
+      "note": "aizex 中转，实测约 1.7 秒，纠错质量好"
+    },
+    {
+      "id": "aizex-gpt-4o-mini",
+      "name": "Aizex - GPT-4o mini",
+      "baseUrl": "https://aizex.top/v1",
+      "apiFormat": "openai",
+      "model": "gpt-4o-mini",
+      "keyName": "AIZEX_API_KEY",
+      "maxTokens": 2048,
+      "timeoutMs": 15000,
+      "thinkParams": "none",
+      "note": "aizex 中转，最便宜，实测约 1.9~2.3 秒"
+    },
+    {
+      "id": "aizex-gpt-4.1",
+      "name": "Aizex - GPT-4.1",
+      "baseUrl": "https://aizex.top/v1",
+      "apiFormat": "openai",
+      "model": "gpt-4.1-2025-04-14",
+      "keyName": "AIZEX_API_KEY",
+      "maxTokens": 2048,
+      "timeoutMs": 15000,
+      "thinkParams": "none",
+      "note": "aizex 中转，实测最快（约 1.5 秒）"
+    }
+  ]
+}
