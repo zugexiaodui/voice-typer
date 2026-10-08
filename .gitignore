@@ -1,0 +1,23 @@
+# ── 依赖（各自按 README 重建）──
+node_modules/
+.venv-qwen3/
+__pycache__/
+*.pyc
+
+# ── 识别模型（自行下载，Qwen3 解压后约 980 MB，远超 GitHub 限制）──
+models/
+
+# ── 个人设置：含你的热键、词表、校验服务选择 ──
+settings.json
+
+# ── 运行期产物 ──
+*.log
+*.wav
+!test.wav
+*.tmp
+*.bak
+*.old
+
+# ── Windows ──
+Thumbs.db
+desktop.ini
