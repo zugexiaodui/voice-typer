@@ -224,7 +224,7 @@ function Show-SettingsDialog {
   $btnClear.Size = [System.Drawing.Size]::new(52, 26)
   $btnClear.Add_Click({ $tbCancel.Text = '' })
   $cancelPanel.Controls.Add($tbCancel); $cancelPanel.Controls.Add($btnClear)
-  AddRow '取消快捷键' $cancelPanel '留空 = 不注册'
+  AddRow '取消快捷键' $cancelPanel '录音时按它放弃本次；AI 校验时按它跳过校验、直接用原文上屏'
 
   # ── 识别语言 ──
   $cbLang = [System.Windows.Forms.ComboBox]::new()

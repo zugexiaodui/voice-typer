@@ -260,7 +260,15 @@ function Show-Overlay {
 
   if (-not $script:Overlay.Form.Visible) {
     $script:Overlay.Form.Show()
-    try { [void][VTNative]::SetWindowPos($script:Overlay.Form.Handle, [IntPtr](-1), 0, 0, 0, 0, 0x0010 -bor 0x0040) } catch { }
+    # 置顶 + 显示。**必须**带上 SWP_NOSIZE(0x0001) 和 SWP_NOMOVE(0x0002)：
+    # 少了这两个，后面那几个 0 会被当成真的"移到原点、尺寸 0x0"，
+    # 窗口就被压成 2x2 钉在屏幕左上角（2x2 是 Windows 的最小窗口尺寸）。
+    # 症状很隐蔽：**第一次**弹悬浮提示什么都看不见，第二次起才正常 ——
+    # 因为这段只在 !Visible 时执行。
+    try {
+      [void][VTNative]::SetWindowPos($script:Overlay.Form.Handle, [IntPtr](-1), 0, 0, 0, 0,
+        (0x0001 -bor 0x0002 -bor 0x0010 -bor 0x0040))
+    } catch { }
   }
   [System.Windows.Forms.Application]::DoEvents()
 }
@@ -534,12 +542,46 @@ function Invoke-Correction {
     $outTask = $p.StandardOutput.ReadToEndAsync()
     $errTask = $p.StandardError.ReadToEndAsync()
     $deadline = [datetime]::Now.AddMilliseconds(([int]$script:Cfg.correctTimeoutMs) + 3000)
+
+    # ── 校验期间把「取消快捷键」临时借回来，让用户能按它跳过校验 ──
+    # 录音一结束取消键就还给系统了，这里再占上（Register-CancelHotkey 是幂等的）。
+    # 因为是 RegisterHotKey 注册的，按它不会漏到前台程序里 —— 用户按 Esc 跳过校验时，
+    # 不会顺手把编辑器里的东西也取消了。
+    $skipped = $false
+    try { Register-CancelHotkey } catch { }
+    if ($script:Cfg.hotkeyCancel -and $script:RegCancel) {
+      # 顺手在悬浮提示里说明一下 —— 不写出来的话这个功能没人会发现
+      try { Show-Overlay -Text ("{0}`r`n`r`n（正在 AI 校验… 按 {1} 跳过）" -f $Text, $script:Cfg.hotkeyCancel) } catch { }
+    }
+
     # 等待期间跑消息泵。脉冲定时器是 WinForms Timer，归属于 UI 线程；
     # Stop-Dictation 是在消息循环里被同步调用的，不泵消息的话这个定时器
     # 一次都触发不了 —— 外圈的弧会僵在原处，比不转更像卡死。
+    #
+    # 这里不用 Application.DoEvents()：它会把 WM_HOTKEY 安静地吞掉、拿不回来。
+    # 改成手写泵，顺手截获 WM_HOTKEY —— "按取消键跳过校验"就是靠这个收到的。
+    $msg = New-Object VTNative+MSG
     while (-not $p.HasExited -and [datetime]::Now -lt $deadline) {
-      [System.Windows.Forms.Application]::DoEvents()
+      while ([VTNative]::PeekMessage([ref]$msg, [IntPtr]::Zero, 0, 0, 1)) {
+        if ($msg.message -eq 0x0312) {
+          # WM_HOTKEY。这时候只可能是取消键；切换键就算按了也被 $script:Busy 挡住，
+          # 一并吞掉，免得回到主循环再触发一次。
+          if ([int]$msg.wParam -eq $ID_CANCEL) { $skipped = $true }
+          continue
+        }
+        [void][VTNative]::TranslateMessage([ref]$msg)
+        [void][VTNative]::DispatchMessage([ref]$msg)
+      }
+      if ($skipped) { break }
       Start-Sleep -Milliseconds 20
+    }
+    try { Unregister-CancelHotkey } catch { }
+
+    if ($skipped) {
+      # 把子进程掐掉就完事了 —— 请求可能已经发出去了，但结果直接丢掉，用原文
+      try { $p.Kill() } catch { }
+      Say '  已跳过 AI 校验（按了取消键），直接用原文上屏' Yellow
+      return $Text
     }
     if (-not $p.HasExited) {
       try { $p.Kill() } catch { }
@@ -567,6 +609,8 @@ function Invoke-Correction {
     # 离开校验状态，回到识别阶段的橙色；紧接着流程会切到 ok → idle。
     # 放在 finally 里是为了覆盖上面每一个 return 分支（超时/无输出/失败）。
     Set-FloatState -State 'working'
+    # 保险：万一泵循环里抛异常没走到那句注销，这里补一刀（幂等，不录音时调它永远安全）
+    try { Unregister-CancelHotkey } catch { }
     $script:Busy = $false
   }
 }
@@ -646,9 +690,10 @@ function Register-AllHotkeys {
     } elseif (-not $Quiet) { Say "录音快捷键: $($t.Text)" Green }
   }
 
-  # 注意：取消键（默认 Esc）不在这里注册，只在录音开始后注册
+  # 注意：取消键（默认 Esc）不在这里注册 —— 只在录音期间、以及 AI 校验等待期间注册，
+  # 其余时刻绝不占着它（Esc 被全局注册会把整个系统的 Esc 都抢走）
   if (-not $Quiet -and $script:Cfg.hotkeyCancel) {
-    Say "取消键: $($script:Cfg.hotkeyCancel)（仅在录音期间生效，不占用系统按键）" DarkGray
+    Say "取消键: $($script:Cfg.hotkeyCancel)（录音时放弃本次 / AI 校验时跳过校验；空闲时不占用）" DarkGray
   }
   return $ok
 }
