@@ -60,9 +60,25 @@ $script:DefaultConfig = [ordered]@{
   #  sensevoice : 快（RTF≈0.034），本地，5 种语言，不支持热词 —— 日常输入首选
   #  qwen3      : 慢约 7 倍（RTF≈0.25），本地，52 语言+22 方言，支持热词偏置
   #               适合高精度场景 / 多语言 / 长文整理
+  #  doubao     : 云端 API，一句话 / 实时识别，无需本地模型，录音将上传且可能计费
+  #  hunyuan    : 腾讯混元云端，录音仅在内存中，不落盘
   engine        = 'sensevoice'
   qwen3ModelDir = ''                 # 留空则自动在 voice-typer\models\ 下查找
   qwen3Hotwords = ''                 # 热词表（逗号/顿号分隔），仅 qwen3 引擎有效
+
+  # ── 豆包云端识别（无需本地模型；凭证只保存引用名称）──
+  doubaoMode        = 'sentence'     # sentence 一句话 | realtime 实时预览
+  doubaoNonstream   = $true          # 实时模式音频二遍识别，独立于 correct 文本 AI 校验
+  doubaoResourceId  = 'volc.seedasr.sauc.duration' # 模型 2.0 小时版；也可选 concurrent
+  doubaoKeyName     = 'DOUBAO_API_KEY' # 环境变量或凭证文件中的名称，不是密钥值
+  doubaoHotwords    = ''             # 逗号/顿号分隔
+  doubaoEndWindowMs = 800            # 静音判句阈值，300~5000 ms
+  doubaoTimeoutMs   = 15000          # 停止发送后等待最终结果的超时，ms
+
+  # ── 腾讯混元云端识别（TokenHub；只保存凭证引用名称，音频仅在内存中发送）──
+  hunyuanModel     = 'hy-asr-3.0-preview' # TokenHub 模型名
+  hunyuanKeyName   = 'HUNYUAN_API_KEY'    # 环境变量/凭证引用名，不是密钥值
+  hunyuanTimeoutMs = 120000               # 单次识别超时（毫秒）
 }
 
 # ───────── 收尾校验的服务预设 ─────────

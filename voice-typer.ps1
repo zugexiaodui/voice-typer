@@ -21,6 +21,9 @@ param(
   [switch]$SettingsOnly,     # 只打开设置窗口，不注册热键（供"已在运行"时唤起）
   [switch]$StreamTest,       # 用真实音频验证流式提交逻辑
   [switch]$CorrectTest,      # 验证收尾 AI 校验（真实调用 API）
+  [switch]$DoubaoTest,       # test.wav 云端测试，不采集麦克风、不粘贴
+  [ValidateSet('sentence','realtime')][string]$DoubaoMode = 'sentence',
+  [switch]$HunyuanTest,      # test.wav 混元连通性测试（只读本地文件，不上屏）
   [switch]$EngineTest,       # 验证当前配置的识别引擎（启动+VAD+识别）
   [int]$RestartAfter = 0     # 供"已在运行"实例用：杀掉指定 PID 的旧实例后接管
 )
@@ -47,7 +50,7 @@ if ($RestartAfter -gt 0) {
   }
   # 顺带清理旧实例可能留下的识别子进程
   Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -match 'worker\.mjs' } |
+    Where-Object { $_.CommandLine -match 'worker(_doubao)?\.mjs' } |
     ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch { } }
   Start-Sleep -Milliseconds 400
   Say '旧实例已结束，重新启动中…' Green
@@ -135,9 +138,13 @@ Add-Type -AssemblyName System.Drawing
 . (Join-Path $AppDir 'icons.ps1')      # SVG 路径渲染器，必须早于 floating.ps1
 . (Join-Path $AppDir 'gui.ps1')
 . (Join-Path $AppDir 'floating.ps1')
+. (Join-Path $AppDir 'doubao.ps1')
+. (Join-Path $AppDir 'hunyuan.ps1')
 
 # ═══════════════════════ 全局配置 ═══════════════════════
 $script:Cfg = Get-Config
+if ($DoubaoTest) { $script:Cfg.engine = 'doubao'; $script:Cfg.doubaoMode = $DoubaoMode }
+if ($HunyuanTest) { $script:Cfg.engine = 'hunyuan' }
 
 # ── 流式相关的固定阈值（必须定义在任何使用点之前：测试块、定时器、动作函数都会用到）──
 $script:MinCommitDelaySec = 5.0       # 录音满 5 秒才允许首次上屏（再短模型会对截断语音编词）
@@ -166,7 +173,7 @@ if ($SettingsOnly) {
 
 # ═══════════════════════ 单实例保护 ═══════════════════════
 # 没有这道检查的话，重复启动会静默失败（热键被占用），用户看不到任何反馈。
-if (-not $Test -and -not $HotkeyTest -and -not $StreamTest -and -not $SettingsOnly -and -not $CorrectTest -and -not $EngineTest) {
+if (-not $Test -and -not $HotkeyTest -and -not $StreamTest -and -not $SettingsOnly -and -not $CorrectTest -and -not $EngineTest -and -not $DoubaoTest -and -not $HunyuanTest) {
   $script:SingleMutex = [System.Threading.Mutex]::new($false, 'Global\voice-typer-single-instance')
   if (-not $script:SingleMutex.WaitOne(0)) {
     Write-Host ''
@@ -270,7 +277,7 @@ function Show-Overlay {
         (0x0001 -bor 0x0002 -bor 0x0010 -bor 0x0040))
     } catch { }
   }
-  [System.Windows.Forms.Application]::DoEvents()
+  $script:Overlay.Form.Update()
 }
 
 function Hide-Overlay {
@@ -353,6 +360,8 @@ function Get-Qwen3ModelDir {
 }
 
 function Get-EngineLabel {
+  if ($script:Cfg.engine -eq 'doubao') { return '豆包云端' }
+  if ($script:Cfg.engine -eq 'hunyuan') { return '腾讯混元' }
   if ($script:Cfg.engine -eq 'qwen3') { return 'Qwen3-ASR-0.6B' }
   return 'SenseVoice'
 }
@@ -364,6 +373,8 @@ function Stop-Worker {
     if (-not $script:Worker.HasExited) { try { $script:Worker.Kill() } catch { } }
   }
   $script:Worker = $null
+  $script:DoubaoRead = $null
+  $script:HunyuanRead = $null
 }
 
 function Start-Worker {
@@ -384,7 +395,21 @@ function Start-Worker {
   $psi.EnvironmentVariables['VT_VAD_MIN_SILENCE'] = "$($script:Cfg.vadMinSilence)"
   $psi.EnvironmentVariables['VT_VAD_MAX_SPEECH']  = "$($script:Cfg.vadMaxSpeech)"
 
-  if ($script:Cfg.engine -eq 'qwen3') {
+  if ($script:Cfg.engine -eq 'doubao') {
+    $psi.FileName = Get-NodeExe
+    $psi.Arguments = '"' + (Join-Path $AppDir 'worker_doubao.mjs') + '"'
+    $psi.EnvironmentVariables['VT_DOUBAO_KEY_NAME'] = [string]$script:Cfg.doubaoKeyName
+    $readyTimeoutMs = 10000
+    $script:DoubaoRead = $null
+  }
+  elseif ($script:Cfg.engine -eq 'hunyuan') {
+    $psi.FileName = Get-NodeExe
+    $psi.Arguments = '"' + (Join-Path $AppDir 'worker_hunyuan.mjs') + '"'
+    $psi.EnvironmentVariables['VT_HUNYUAN_KEY_NAME'] = [string]$script:Cfg.hunyuanKeyName
+    $readyTimeoutMs = 10000
+    $script:HunyuanRead = $null
+  }
+  elseif ($script:Cfg.engine -eq 'qwen3') {
     $py = Get-PythonExe
     $modelDir = Get-Qwen3ModelDir
     $psi.FileName  = $py
@@ -699,6 +724,16 @@ function Register-AllHotkeys {
 }
 
 # ═══════════════════════ 自检 ═══════════════════════
+if ($DoubaoTest) {
+  try { Say (Invoke-DoubaoFileTest -Config $script:Cfg) Green; exit 0 }
+  catch { Say ('豆包测试失败：' + $_.Exception.Message) Red; exit 1 }
+}
+
+if ($HunyuanTest) {
+  try { Say (Invoke-HunyuanFileTest -Config $script:Cfg) Green; exit 0 }
+  catch { Say ('混元测试失败：' + $_.Exception.Message) Red; exit 1 }
+}
+
 if ($Test) {
   Say '── 自检 ──' Cyan
   Say ("配置文件 : $script:ConfigPath") DarkGray
@@ -724,20 +759,30 @@ if ($Test) {
     }
   } else { Say '  未设置取消键' DarkGray }
 
-  Say '启动识别进程…' DarkGray
-  $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  Start-Worker
-  Say ("模型就绪 {0} ms" -f $sw.ElapsedMilliseconds) Green
-
-  $wav = Join-Path $AppDir 'test.wav'
-  if (Test-Path $wav) {
-    $sw.Restart(); $text = (Invoke-Recognition -WavPath $wav).Text; $sw.Stop()
-    Say ("识别: {0}  ({1} ms)" -f $text, $sw.ElapsedMilliseconds) Green
+  if ($script:Cfg.engine -eq 'doubao') {
+    Say '测试豆包云端识别…' DarkGray
+    try { Say (Invoke-DoubaoFileTest -Config $script:Cfg) Green }
+    catch { Say ("豆包测试失败: {0}" -f $_.Exception.Message) Red; exit 1 }
+  } elseif ($script:Cfg.engine -eq 'hunyuan') {
+    Say '测试腾讯混元识别…' DarkGray
+    try { Say (Invoke-HunyuanFileTest -Config $script:Cfg) Green }
+    catch { Say ("混元测试失败: {0}" -f $_.Exception.Message) Red; exit 1 }
   } else {
-    Say '实录 2 秒麦克风…' DarkGray
-    Start-Recording; Start-Sleep -Milliseconds 2000; Stop-Recording
-    $sw.Restart(); $text = (Invoke-Recognition -WavPath $script:RecFile).Text; $sw.Stop()
-    Say ("话筒识别: 「{0}」  ({1} ms)" -f $text, $sw.ElapsedMilliseconds) Green
+    Say '启动识别进程…' DarkGray
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Start-Worker
+    Say ("模型就绪 {0} ms" -f $sw.ElapsedMilliseconds) Green
+
+    $wav = Join-Path $AppDir 'test.wav'
+    if (Test-Path $wav) {
+      $sw.Restart(); $text = (Invoke-Recognition -WavPath $wav).Text; $sw.Stop()
+      Say ("识别: {0}  ({1} ms)" -f $text, $sw.ElapsedMilliseconds) Green
+    } else {
+      Say '实录 2 秒麦克风…' DarkGray
+      Start-Recording; Start-Sleep -Milliseconds 2000; Stop-Recording
+      $sw.Restart(); $text = (Invoke-Recognition -WavPath $script:RecFile).Text; $sw.Stop()
+      Say ("话筒识别: 「{0}」  ({1} ms)" -f $text, $sw.ElapsedMilliseconds) Green
+    }
   }
 
   Say '测试托盘图标与设置窗口…' DarkGray
@@ -949,6 +994,16 @@ function Select-CompletedSegments {
 if ($EngineTest) {
   Say '── 引擎验证 ──' Cyan
   Say ("引擎: {0}" -f (Get-EngineLabel)) Green
+  if ($script:Cfg.engine -eq 'doubao') {
+    Say ("模式: {0}   二遍识别: {1}   资源: {2}" -f $script:Cfg.doubaoMode, $script:Cfg.doubaoNonstream, $script:Cfg.doubaoResourceId) DarkGray
+    try { Say (Invoke-DoubaoFileTest -Config $script:Cfg) Green; Say '引擎验证完成' Cyan; exit 0 }
+    catch { Say ("验证失败: {0}" -f $_.Exception.Message) Red; exit 1 }
+  }
+  if ($script:Cfg.engine -eq 'hunyuan') {
+    Say ("模型: {0}   超时: {1} ms   纯内存录音" -f $script:Cfg.hunyuanModel, $script:Cfg.hunyuanTimeoutMs) DarkGray
+    try { Say (Invoke-HunyuanFileTest -Config $script:Cfg) Green; Say '引擎验证完成' Cyan; exit 0 }
+    catch { Say ("验证失败: {0}" -f $_.Exception.Message) Red; exit 1 }
+  }
   Say ("线程: {0}   语言: {1}" -f $script:Cfg.threads, $script:Cfg.lang) DarkGray
 
   if ($script:Cfg.engine -eq 'qwen3') {
@@ -1147,6 +1202,8 @@ $script:Streaming = $null
 
 function Start-Dictation {
   if ($recording) { return }
+  if ($script:Cfg.engine -eq 'doubao') { Start-DoubaoDictation; return }
+  if ($script:Cfg.engine -eq 'hunyuan') { Start-HunyuanDictation; return }
   try {
     $script:target = [VTNative]::GetForegroundWindow()
     Start-Recording
@@ -1185,6 +1242,8 @@ function Start-Dictation {
 
 function Stop-Dictation {
   param([switch]$Cancel)
+  if ($script:Doubao) { Stop-DoubaoDictation -Cancel:$Cancel; return }
+  if ($script:Hunyuan) { Stop-HunyuanDictation -Cancel:$Cancel; return }
   if (-not $script:recording) { return }
   $script:recording = $false
   $script:StreamTimer.Stop()
@@ -1350,6 +1409,11 @@ function Invoke-ToggleDictation {
 # 设置保存后的回调：重新注册热键 + 重建识别进程
 $script:OnSettingsSaved = {
   param($newCfg)
+  if ($script:Doubao) {
+    $script:PendingCloudConfig = $newCfg
+    Say '设置已保存，将在本次豆包识别完成后生效' DarkGray
+    return
+  }
   $oldEngine = $script:Cfg.engine
   $script:Cfg = $newCfg
   if (Register-AllHotkeys) { Say '快捷键已更新' Green } else { Say '快捷键注册失败，请在设置里更换' Red }
@@ -1391,7 +1455,7 @@ $script:OnExitRequest = {
 
 try {
   Say ('─' * 60) DarkGray
-  Say 'voice-typer  全局语音输入 · 本地识别 · 音频不出本机' Green
+  Say ('voice-typer  全局语音输入 · ' + (Get-EngineLabel)) Green
   Say ('─' * 60) DarkGray
 
   Start-Tray -Config $script:Cfg
@@ -1412,7 +1476,7 @@ try {
     $script:PulseTimer.Start()
   }
 
-  Say '预热识别模型…' DarkGray
+  Say ('准备识别引擎：' + (Get-EngineLabel)) DarkGray
   try { Start-Worker; Say "模型就绪（$($script:Cfg.lang) / $($script:Cfg.threads) 线程）" Green }
   catch { Say "预热失败: $($_.Exception.Message)" Yellow; Show-Balloon -Title 'voice-typer' -Text "模型加载失败: $($_.Exception.Message)" -Kind Error }
 
@@ -1445,11 +1509,14 @@ try {
 finally {
   if ($script:PulseTimer) { $script:PulseTimer.Stop() }
   if ($script:StreamTimer) { $script:StreamTimer.Stop() }
+  if ($script:DoubaoTimer) { $script:DoubaoTimer.Stop() }
   $script:Streaming = $null
   Unregister-AllHotkeys
   Stop-FloatButton
   Stop-Tray
-  if ($recording) { Stop-Recording -Silent }
+  if ($script:Doubao) { Stop-DoubaoDictation -Cancel }
+  elseif ($script:Hunyuan) { Stop-HunyuanDictation -Cancel }
+  elseif ($recording) { Stop-Recording -Silent }
   Stop-Worker
   Remove-Item $script:RecFile -Force -ErrorAction SilentlyContinue
   Say 'voice-typer 已退出' DarkGray

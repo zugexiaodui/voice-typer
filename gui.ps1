@@ -192,7 +192,19 @@ function Show-SettingsDialog {
     $h.Margin = [System.Windows.Forms.Padding]::new(0, 6, 0, 6)
     $grid.Controls.Add($h, 2, $script:row)
     [void]$grid.SetColumnSpan($h, 2)
+    [void]$grid.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
     $script:row++
+  }
+
+  # 隐藏整行并折叠高度，避免云端选项在本地引擎下留下大片空白。
+  function Set-SettingsRowVisible {
+    param($Control, [bool]$Visible)
+    $rowIndex = $grid.GetPositionFromControl($Control).Row
+    foreach ($item in $grid.Controls) {
+      if ($grid.GetPositionFromControl($item).Row -eq $rowIndex) { $item.Visible = $Visible }
+    }
+    $grid.RowStyles[$rowIndex].SizeType = if ($Visible) { 'AutoSize' } else { 'Absolute' }
+    $grid.RowStyles[$rowIndex].Height = 0
   }
 
   # ── 录音快捷键 ──
@@ -259,17 +271,176 @@ function Show-SettingsDialog {
   $cbEngine.DropDownStyle = 'DropDownList'
   [void]$cbEngine.Items.AddRange(@(
     'sensevoice|SenseVoice —— 快（推荐日常）',
-    'qwen3|Qwen3-ASR-0.6B —— 准（多语言，慢约7倍）'
+    'qwen3|Qwen3-ASR-0.6B —— 准（多语言，慢约7倍）',
+    'doubao|豆包云端 —— 联网识别，无需本地模型',
+    'hunyuan|腾讯混元 —— 云端识别，纯内存不落盘'
   ))
   foreach ($i in 0..($cbEngine.Items.Count - 1)) {
     if ($cbEngine.Items[$i].ToString().StartsWith("$($Config.engine)|")) { $cbEngine.SelectedIndex = $i; break }
   }
   if ($cbEngine.SelectedIndex -lt 0) { $cbEngine.SelectedIndex = 0 }
-  AddRow '识别引擎' $cbEngine 'Qwen3 支持 52 语言+22 方言，但每句约 1.2 秒'
+  AddRow '识别引擎' $cbEngine '本地引擎离线识别；豆包/混元联网识别、无需下载模型；混元录音仅在内存中，不落盘'
 
   $tbHotwords = [System.Windows.Forms.TextBox]::new()
   $tbHotwords.Text = [string]$Config.qwen3Hotwords
   AddRow 'Qwen3 热词' $tbHotwords '仅 Qwen3 有效：提升专有名词准确率，逗号分隔'
+
+  # ── 豆包云端（只保存凭证名称，不读取或显示实际密钥）──
+  $cbDoubaoMode = [System.Windows.Forms.ComboBox]::new()
+  $cbDoubaoMode.DropDownStyle = 'DropDownList'
+  [void]$cbDoubaoMode.Items.AddRange(@('sentence|一句话识别：说完返回整句', 'realtime|实时识别：说话时预览文字'))
+  $cbDoubaoMode.SelectedIndex = if ($Config.doubaoMode -eq 'realtime') { 1 } else { 0 }
+  AddRow '豆包识别模式' $cbDoubaoMode '两种模式均边录边传；实时模式的临时文字可能修订'
+
+  $ckDoubaoNonstream = [System.Windows.Forms.CheckBox]::new()
+  $ckDoubaoNonstream.Text = '句末音频二遍识别'
+  $ckDoubaoNonstream.Checked = [bool]$Config.doubaoNonstream
+  AddRow '' $ckDoubaoNonstream '实时模式句末重新识别音频；与下方文字 AI 校验独立'
+
+  $cbDoubaoResource = [System.Windows.Forms.ComboBox]::new()
+  $cbDoubaoResource.DropDownStyle = 'DropDownList'
+  [void]$cbDoubaoResource.Items.AddRange(@(
+    'volc.seedasr.sauc.duration|模型 2.0 · 小时版（按量计费，个人推荐）',
+    'volc.seedasr.sauc.concurrent|模型 2.0 · 并发版（包月并发，企业专用）'
+  ))
+  $cbDoubaoResource.SelectedIndex = if ($Config.doubaoResourceId -eq 'volc.seedasr.sauc.concurrent') { 1 } else { 0 }
+  AddRow '豆包计费通道' $cbDoubaoResource '固定选「小时版」即可；切换一句话/实时模式无需改此项'
+
+  $tbDoubaoKey = [System.Windows.Forms.TextBox]::new()
+  $tbDoubaoKey.Text = [string]$Config.doubaoKeyName
+  AddRow '豆包密钥名称' $tbDoubaoKey '填环境变量或凭证引用名（如 DOUBAO_API_KEY），不要填密钥值'
+
+  $tbDoubaoHotwords = [System.Windows.Forms.TextBox]::new()
+  $tbDoubaoHotwords.Text = [string]$Config.doubaoHotwords
+  AddRow '豆包热词' $tbDoubaoHotwords '逗号或顿号分隔，用于人名、术语；不会修改 AI 整理词表'
+
+  $numDoubaoEnd = [System.Windows.Forms.NumericUpDown]::new()
+  $numDoubaoEnd.Minimum = 300; $numDoubaoEnd.Maximum = 5000; $numDoubaoEnd.Increment = 100
+  $numDoubaoEnd.Value = [Math]::Max(300, [Math]::Min(5000, [int]$Config.doubaoEndWindowMs))
+  AddRow '豆包静音判句(ms)' $numDoubaoEnd '建议 800~1000；过小容易把思考停顿分成多句'
+
+  $numDoubaoTimeout = [System.Windows.Forms.NumericUpDown]::new()
+  $numDoubaoTimeout.Minimum = 1000; $numDoubaoTimeout.Maximum = 120000; $numDoubaoTimeout.Increment = 1000
+  $numDoubaoTimeout.Value = [Math]::Max(1000, [Math]::Min(120000, [int]$Config.doubaoTimeoutMs))
+  AddRow '豆包收尾超时(ms)' $numDoubaoTimeout '停止发送音频后等待最终结果的时限，不限制录音时长'
+
+  # 主程序可注册 OnDoubaoTest($config)：接收未保存配置、负责异步等待和 UI 消息泵，返回状态文字。
+  # 此界面不启动录音、不处理凭证，也不保存测试时输入的设置。
+  $btnDoubaoTest = [System.Windows.Forms.Button]::new()
+  $btnDoubaoTest.Text = '测试豆包连接'
+  $btnDoubaoTest.Enabled = [bool]$script:OnDoubaoTest
+  AddRow '' $btnDoubaoTest '使用内置测试音频验证；测试结果不会粘贴到其他程序'
+
+  function Get-DoubaoSettingsFromControls {
+    $settings = Get-Config
+    $settings.engine = 'doubao'
+    $settings.doubaoMode = $cbDoubaoMode.SelectedItem.ToString().Split('|')[0]
+    $settings.doubaoNonstream = [bool]$ckDoubaoNonstream.Checked
+    $settings.doubaoResourceId = $cbDoubaoResource.SelectedItem.ToString().Split('|')[0]
+    $settings.doubaoKeyName = $tbDoubaoKey.Text.Trim()
+    $settings.doubaoHotwords = $tbDoubaoHotwords.Text.Trim()
+    $settings.doubaoEndWindowMs = [int]$numDoubaoEnd.Value
+    $settings.doubaoTimeoutMs = [int]$numDoubaoTimeout.Value
+    return $settings
+  }
+
+  # 凭证引用应是环境变量名，避免误把常见 UUID 格式的 API Key 保存进 settings.json。
+  function Test-DoubaoKeyReference {
+    return $tbDoubaoKey.Text.Trim() -match '^[A-Za-z_][A-Za-z0-9_]*$'
+  }
+
+  $btnDoubaoTest.Add_Click({
+      if (-not (Test-DoubaoKeyReference)) {
+        [System.Windows.Forms.MessageBox]::Show('请填写密钥的环境变量／凭证引用名称，例如 DOUBAO_API_KEY；不要填写实际密钥。', '豆包连接测试', 'OK', 'Warning') | Out-Null
+        return
+      }
+      if (-not $script:OnDoubaoTest) { return }
+      $btnDoubaoTest.Enabled = $false
+      $btnSave.Enabled = $false
+      $lblState.ForeColor = [System.Drawing.Color]::DimGray
+      $lblState.Text = '正在测试豆包服务，请稍候…'
+      try {
+        $status = & $script:OnDoubaoTest (Get-DoubaoSettingsFromControls)
+        if (-not $form.IsDisposed) { $lblState.Text = [string]$status }
+      } catch {
+        if (-not $form.IsDisposed) {
+          $lblState.ForeColor = [System.Drawing.Color]::Firebrick
+          $lblState.Text = "豆包测试出错：$($_.Exception.Message)"
+        }
+      } finally {
+        if (-not $form.IsDisposed) {
+          $btnDoubaoTest.Enabled = [bool]$script:OnDoubaoTest
+          $btnSave.Enabled = $true
+        }
+      }
+    })
+
+  # ── 腾讯混元云端（TokenHub；只保存凭证名称，音频仅在内存中处理）──
+  $tbHunyuanModel = [System.Windows.Forms.TextBox]::new()
+  $tbHunyuanModel.Text = [string]$Config.hunyuanModel
+  AddRow '混元模型' $tbHunyuanModel 'TokenHub 模型名，默认 hy-asr-3.0-preview'
+
+  $tbHunyuanKey = [System.Windows.Forms.TextBox]::new()
+  $tbHunyuanKey.Text = [string]$Config.hunyuanKeyName
+  AddRow '混元密钥名称' $tbHunyuanKey '填环境变量或凭证引用名（如 HUNYUAN_API_KEY），不要填密钥值'
+
+  $numHunyuanTimeout = [System.Windows.Forms.NumericUpDown]::new()
+  $numHunyuanTimeout.Minimum = 1000; $numHunyuanTimeout.Maximum = 600000; $numHunyuanTimeout.Increment = 1000
+  $numHunyuanTimeout.Value = [Math]::Max(1000, [Math]::Min(600000, [int]$Config.hunyuanTimeoutMs))
+  AddRow '混元超时(ms)' $numHunyuanTimeout '单次识别等待上限，不限制录音时长'
+
+  $lblHunyuanInfo = [System.Windows.Forms.Label]::new()
+  $lblHunyuanInfo.Text = '纯内存识别'
+  $lblHunyuanInfo.TextAlign = 'MiddleLeft'
+  $lblHunyuanInfo.ForeColor = [System.Drawing.Color]::DimGray
+  AddRow '混元隐私' $lblHunyuanInfo '录音全程在内存中，不写入磁盘；识别后可选 AI 校验'
+
+  # 主程序可注册 OnHunyuanTest($config)：接收未保存配置、负责异步等待和 UI 消息泵，返回状态文字。
+  # 此界面不启动录音、不处理凭证，也不保存测试时输入的设置。
+  $btnHunyuanTest = [System.Windows.Forms.Button]::new()
+  $btnHunyuanTest.Text = '测试混元连接'
+  $btnHunyuanTest.Enabled = [bool]$script:OnHunyuanTest
+  AddRow '' $btnHunyuanTest '使用内置测试音频验证；测试结果不会粘贴到其他程序'
+
+  function Get-HunyuanSettingsFromControls {
+    $settings = Get-Config
+    $settings.engine = 'hunyuan'
+    $settings.hunyuanModel = $tbHunyuanModel.Text.Trim()
+    $settings.hunyuanKeyName = $tbHunyuanKey.Text.Trim()
+    $settings.hunyuanTimeoutMs = [int]$numHunyuanTimeout.Value
+    return $settings
+  }
+
+  # 凭证引用应是环境变量名，避免误把实际 API Key 保存进 settings.json。
+  function Test-HunyuanKeyReference {
+    return $tbHunyuanKey.Text.Trim() -match '^[A-Za-z_][A-Za-z0-9_]*$'
+  }
+
+  $btnHunyuanTest.Add_Click({
+      if (-not (Test-HunyuanKeyReference)) {
+        [System.Windows.Forms.MessageBox]::Show('请填写密钥的环境变量／凭证引用名称，例如 HUNYUAN_API_KEY；不要填写实际密钥。', '混元连接测试', 'OK', 'Warning') | Out-Null
+        return
+      }
+      if (-not $script:OnHunyuanTest) { return }
+      $btnHunyuanTest.Enabled = $false
+      $btnSave.Enabled = $false
+      $lblState.ForeColor = [System.Drawing.Color]::DimGray
+      $lblState.Text = '正在测试混元服务，请稍候…'
+      try {
+        $status = & $script:OnHunyuanTest (Get-HunyuanSettingsFromControls)
+        if (-not $form.IsDisposed) { $lblState.Text = [string]$status }
+      } catch {
+        if (-not $form.IsDisposed) {
+          $lblState.ForeColor = [System.Drawing.Color]::Firebrick
+          $lblState.Text = "混元测试出错：$($_.Exception.Message)"
+        }
+      } finally {
+        if (-not $form.IsDisposed) {
+          $btnHunyuanTest.Enabled = [bool]$script:OnHunyuanTest
+          $btnSave.Enabled = $true
+        }
+      }
+    })
 
   # ── 悬浮按钮图标来源 ──
   $cbIcon = [System.Windows.Forms.ComboBox]::new()
@@ -299,6 +470,52 @@ function Show-SettingsDialog {
   $ckCorrect.Text = '收尾 AI 校验：说完后送大模型纠错（需联网）'
   $ckCorrect.Checked = [bool]$Config.correct
   AddRow '' $ckCorrect '开启后说话时不粘贴，等校验完成一次性上屏'
+
+  # 模式与粘贴策略分别设置；切换引擎或模式只改变控件可用性，不改写已选开关。
+  $streamHint = $grid.GetControlFromPosition(2, $grid.GetPositionFromControl($ckStream).Row)
+  $doubaoRows = @($cbDoubaoMode, $ckDoubaoNonstream, $cbDoubaoResource, $tbDoubaoKey,
+                  $tbDoubaoHotwords, $numDoubaoEnd, $numDoubaoTimeout, $btnDoubaoTest)
+  $hunyuanRows = @($tbHunyuanModel, $tbHunyuanKey, $numHunyuanTimeout, $lblHunyuanInfo, $btnHunyuanTest)
+  $updateEngineControls = {
+      $selectedEngine = $cbEngine.SelectedItem.ToString().Split('|')[0]
+      $isDoubao = $selectedEngine -eq 'doubao'
+      $isHunyuan = $selectedEngine -eq 'hunyuan'
+      $isCloudEngine = $isDoubao -or $isHunyuan
+      $isRealtime = $cbDoubaoMode.SelectedIndex -eq 1
+      $grid.SuspendLayout()
+      try {
+        foreach ($control in @($cbLang, $numThreads, $numIdle)) { $control.Enabled = -not $isCloudEngine }
+        Set-SettingsRowVisible -Control $tbHotwords -Visible ($selectedEngine -eq 'qwen3')
+        foreach ($control in $doubaoRows) { Set-SettingsRowVisible -Control $control -Visible $isDoubao }
+        foreach ($control in $hunyuanRows) { Set-SettingsRowVisible -Control $control -Visible $isHunyuan }
+        $ckDoubaoNonstream.Enabled = $isDoubao -and $isRealtime
+        if ($isDoubao) {
+          $ckStream.Text = '边说边上屏（仅提交已确定分句）'
+          $ckStream.Enabled = $isRealtime -and -not $ckCorrect.Checked -and $ckPaste.Checked
+          $streamHint.Text = if ($ckCorrect.Checked) {
+            'AI 校验开启：预览后整段校验、一次粘贴；此开关暂不生效'
+          } elseif (-not $isRealtime) {
+            '一句话模式说完后粘贴；切到实时模式可预览并逐句上屏'
+          } else {
+            '仅控制粘贴时机；关闭后仍可在悬浮窗显示临时识别结果'
+          }
+        } else {
+          $ckStream.Text = '流式模式：边说边上屏（停顿即定稿，只追加不修改）'
+          $ckStream.Enabled = $true
+          $streamHint.Text = "每隔 $([double]$Config.streamTickMs / 1000) 秒做一次增量识别"
+        }
+        if ($isHunyuan) {
+          $ckStream.Text = '说完后整段识别并粘贴；不落盘'
+          $ckStream.Enabled = $false
+          $streamHint.Text = '混元为整段识别，不支持边说要边上屏'
+        }
+      } finally { $grid.ResumeLayout($true) }
+    }
+  $cbEngine.Add_SelectedIndexChanged($updateEngineControls)
+  $cbDoubaoMode.Add_SelectedIndexChanged($updateEngineControls)
+  $ckCorrect.Add_CheckedChanged($updateEngineControls)
+  $ckPaste.Add_CheckedChanged($updateEngineControls)
+  & $updateEngineControls
 
   $cbMode = [System.Windows.Forms.ComboBox]::new()
   $cbMode.DropDownStyle = 'DropDownList'
@@ -548,10 +765,27 @@ function Show-SettingsDialog {
       $newCfg.correctFillers  = $tbFillers.Text.Trim()
       $newCfg.engine          = $cbEngine.SelectedItem.ToString().Split('|')[0]
       $newCfg.qwen3Hotwords   = $tbHotwords.Text.Trim()
+      $doubaoSettings = Get-DoubaoSettingsFromControls
+      foreach ($key in @('doubaoMode', 'doubaoNonstream', 'doubaoResourceId', 'doubaoKeyName',
+                         'doubaoHotwords', 'doubaoEndWindowMs', 'doubaoTimeoutMs')) {
+        $newCfg[$key] = $doubaoSettings[$key]
+      }
+      $hunyuanSettings = Get-HunyuanSettingsFromControls
+      foreach ($key in @('hunyuanModel', 'hunyuanKeyName', 'hunyuanTimeoutMs')) {
+        $newCfg[$key] = $hunyuanSettings[$key]
+      }
       $newCfg.showOverlay = [bool]$ckOverlay.Checked
       $newCfg.showFloat   = [bool]$ckFloat.Checked
       $newCfg.notifyOnStart = [bool]$ckNotify.Checked
 
+      if (-not (Test-DoubaoKeyReference)) {
+        [System.Windows.Forms.MessageBox]::Show('豆包密钥名称应为环境变量／凭证引用名称，例如 DOUBAO_API_KEY；请勿保存实际密钥。', 'voice-typer', 'OK', 'Warning') | Out-Null
+        return
+      }
+      if (-not (Test-HunyuanKeyReference)) {
+        [System.Windows.Forms.MessageBox]::Show('混元密钥名称应为环境变量／凭证引用名称，例如 HUNYUAN_API_KEY；请勿保存实际密钥。', 'voice-typer', 'OK', 'Warning') | Out-Null
+        return
+      }
       if (-not (ConvertTo-HotkeyParts -Text $newCfg.hotkeyToggle)) {
         [System.Windows.Forms.MessageBox]::Show('录音快捷键无效，请重新设置。', 'voice-typer', 'OK', 'Warning') | Out-Null
         return
@@ -614,6 +848,20 @@ function Start-Tray {
   $menu.Add_Opening({
       $cur = [string]$script:Cfg.correctPreset
       foreach ($it in $script:CorrMenuItems) { $it.Checked = ([string]$it.Tag -eq $cur) }
+    })
+
+  $miRecovery = $menu.Items.Add('复制上次未完成识别')
+  $miRecovery.Add_Click({
+      if ([string]::IsNullOrWhiteSpace([string]$script:DoubaoRecoveryText)) {
+        Show-Balloon -Title 'voice-typer' -Text '没有可恢复的未完成识别文字。'
+        return
+      }
+      try {
+        [System.Windows.Forms.Clipboard]::SetText([string]$script:DoubaoRecoveryText)
+        Show-Balloon -Title 'voice-typer' -Text '已复制上次未完成识别的文字，请检查后使用。'
+      } catch {
+        Show-Balloon -Title 'voice-typer' -Text '复制失败，请稍后重试。' -Kind Warning
+      }
     })
 
   $miTip = $menu.Items.Add('快捷键说明')
