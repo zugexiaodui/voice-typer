@@ -1,7 +1,6 @@
 # 腾讯混元云端识别：录音全程在内存中（waveIn），不写任何文件。
 # 与豆包不同，混元是"整段识别"：停止录音后一次性把 PCM 交给 worker。
 $script:Hunyuan              = $null
-$script:HunyuanRead          = $null
 $script:HunyuanBusy          = $false
 $script:HunyuanRecoveryText  = ''
 
@@ -18,8 +17,7 @@ function New-HunyuanRequest {
 function Send-HunyuanCommand {
   param($Command)
   if (-not $script:Worker -or $script:Worker.HasExited) { throw '混元通信进程已退出' }
-  $script:Worker.StandardInput.WriteLine(($Command | ConvertTo-Json -Depth 6 -Compress))
-  $script:Worker.StandardInput.Flush()
+  Send-WorkerLine -Line ($Command | ConvertTo-Json -Depth 6 -Compress) -TimeoutMs 5000
 }
 
 # 读取 worker 已到达的输出；返回 $true 表示本次识别已到终态。
@@ -29,11 +27,11 @@ function Update-HunyuanResult {
   $done = $false
   try {
     for ($i = 0; $i -lt 200; $i++) {
-      if (-not $script:HunyuanRead) { $script:HunyuanRead = $script:Worker.StandardOutput.ReadLineAsync() }
-      if (-not $script:HunyuanRead.IsCompleted) { break }
-      $line = $script:HunyuanRead.GetAwaiter().GetResult()
-      $script:HunyuanRead = $null
-      if ($null -eq $line) { throw '混元通信进程意外退出' }
+      $line = $null
+      $status = $script:WorkerPipe.ReadLine(0, [ref]$line)
+      if ($status -eq 1) { break }
+      if ($status -eq 3) { throw ('混元通信进程读取失败：' + $script:WorkerPipe.LastError) }
+      if ($status -eq 2) { throw '混元通信进程意外退出' }
       if (-not $line.Trim()) { continue }
       try { $e = $line | ConvertFrom-Json } catch { continue }
       if ($e.event -eq 'ready') { continue }
@@ -208,6 +206,7 @@ function Stop-HunyuanDictation {
     Start-Sleep -Milliseconds 1200
     Hide-Overlay
   } finally {
+    if ($script:WorkerPipe -and ($script:WorkerPipe.IsFaulted -or $script:WorkerPipe.IsEnded)) { Stop-Worker }
     try { $s.Capture.Dispose() } catch { Say $_.Exception.Message Yellow }
     Unregister-CancelHotkey
     $script:Hunyuan = $null
@@ -236,6 +235,8 @@ function Invoke-HunyuanFileTest {
   $psi.Environment['VT_HUNYUAN_KEY_NAME'] = [string]$Config.hunyuanKeyName
 
   $p = [Diagnostics.Process]::Start($psi)
+  try { $pipe = New-WorkerPipe -Process $p }
+  catch { try { $p.Kill() } catch { }; $p.Dispose(); throw }
   $null = $p.StandardError.ReadToEndAsync()
   $id = [guid]::NewGuid().ToString()
   $req = New-HunyuanRequest -Config $Config -Session $id
@@ -244,15 +245,16 @@ function Invoke-HunyuanFileTest {
   $oldBusy = $script:Busy; $script:Busy = $true
   $sent = $false
   try {
-    $read = $p.StandardOutput.ReadLineAsync()
     while ($clock.Elapsed.TotalSeconds -lt 150) {
       Invoke-HunyuanMessages
-      if (-not $read.IsCompleted) { Start-Sleep -Milliseconds 15; continue }
-      $line = $read.GetAwaiter().GetResult()
-      if ($null -eq $line) { throw '混元测试进程已退出' }
-      try { $e = $line | ConvertFrom-Json } catch { $read = $p.StandardOutput.ReadLineAsync(); continue }
+      $line = $null
+      $status = $pipe.ReadLine(20, [ref]$line)
+      if ($status -eq 1) { continue }
+      if ($status -eq 3) { throw ('混元测试进程读取失败：' + $pipe.LastError) }
+      if ($status -eq 2) { throw '混元测试进程已退出' }
+      try { $e = $line | ConvertFrom-Json } catch { continue }
       if ($e.event -eq 'ready' -and -not $sent) {
-        $p.StandardInput.WriteLine(($req | ConvertTo-Json -Depth 6 -Compress)); $p.StandardInput.Flush(); $sent = $true
+        $pipe.WriteLine(($req | ConvertTo-Json -Depth 6 -Compress), 5000); $sent = $true
       }
       if ([string]$e.session -eq $id) {
         if ($e.event -eq 'error') { throw ('{0}（{1}）' -f $e.error, $e.code) }
@@ -262,13 +264,13 @@ function Invoke-HunyuanFileTest {
                  "`r`n（下面这句是软件内置样例音频 test.wav 的识别内容，用于证明识别可用，不是报错）`r`n识别结果：$($e.text)"
         }
       }
-      $read = $p.StandardOutput.ReadLineAsync()
     }
     throw '混元测试超时'
   } finally {
     $script:Busy = $oldBusy
-    try { $p.StandardInput.WriteLine('{"cmd":"exit"}'); $p.StandardInput.Flush() } catch { }
+    try { $pipe.WriteLine('{"cmd":"exit"}', 750) } catch { }
     if (-not $p.WaitForExit(1500)) { try { $p.Kill() } catch { } }
+    try { $pipe.Dispose() } catch { }
     $p.Dispose()
   }
 }

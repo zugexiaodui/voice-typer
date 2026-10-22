@@ -290,6 +290,8 @@ voice-typer/
 ├── 启动（带窗口）.bat        带控制台启动
 ├── 启动（静默）.vbs          后台启动
 ├── voice-typer.ps1          主程序：热键、录音、编排、上屏
+├── worker-pipe.ps1          worker stdio 桥：后台 stdout 泵 + 有界 stdin 写队列
+├── worker-pipe-mock.mjs      离线集成测试用的合成 JSONL worker（无网络）
 ├── config.ps1               配置读写 + 预设解析
 ├── gui.ps1                  设置窗口 + 托盘菜单
 ├── floating.ps1             悬浮按钮：分层窗口绘制 + 状态机
@@ -411,6 +413,25 @@ voice-typer/
 
 见 [`识别调优说明.md`](识别调优说明.md) —— 里面有完整的排查记录：参数实测数据、踩过的坑、每处改动的动机。写着"为什么是现在这样"。
 </details>
+
+---
+
+## 测试
+
+在仓库根目录、Windows 上离线运行（不需要密钥、模型、麦克风或网络）：
+
+```powershell
+# worker 协议与归一化（Node）
+node --test .\doubao-worker.test.mjs .\hunyuan-worker.test.mjs
+
+# stdio 桥生产路径（PowerShell + C# 桥 + 本地 mock worker）
+pwsh -NoProfile -File .\worker-pipe.test.ps1
+```
+
+`worker-pipe.test.ps1` 会启动 `worker-pipe-mock.mjs`，覆盖 >64 KB result 连续输出与音频同时写入、
+stdin 写端停顿、stdout 队列溢出、worker 退出 EOF、重复启动/停止和进程清理；并用真实
+`Update-DoubaoSession`/`Receive-DoubaoEvent` 回归 finished/result 紧接进程退出、只有非最终结果即退出、
+空 EOF、晚到旧 session finished 等场景。测试只用合成数据。
 
 ---
 

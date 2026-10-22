@@ -134,6 +134,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 # ═══════════════════════ 子模块 ═══════════════════════
+. (Join-Path $AppDir 'worker-pipe.ps1')  # 独立后台泵 + 有界写队列，必须早于 Start-Worker 调用
 . (Join-Path $AppDir 'config.ps1')
 . (Join-Path $AppDir 'icons.ps1')      # SVG 路径渲染器，必须早于 floating.ps1
 . (Join-Path $AppDir 'gui.ps1')
@@ -318,6 +319,7 @@ function Flush-RecordedAudio {
 
 # ═══════════════════════ 常驻识别进程 ═══════════════════════
 $script:Worker = $null
+$script:WorkerPipe = $null
 $script:Mid = 0
 $script:WorkerLog = Join-Path $env:TEMP 'voice-typer-worker.log'
 
@@ -367,18 +369,31 @@ function Get-EngineLabel {
 }
 
 function Stop-Worker {
-  if ($script:Worker -and -not $script:Worker.HasExited) {
-    try { $script:Worker.StandardInput.WriteLine('{"cmd":"exit"}'); $script:Worker.StandardInput.Flush() } catch { }
-    Start-Sleep -Milliseconds 250
-    if (-not $script:Worker.HasExited) { try { $script:Worker.Kill() } catch { } }
+  $worker = $script:Worker
+  $pipe = $script:WorkerPipe
+  if ($worker) {
+    if (-not $worker.HasExited) {
+      # 退出命令也走有界队列；管道已坏时直接进入 Kill 兜底，不回到无超时写。
+      try { if ($pipe) { $pipe.WriteLine('{"cmd":"exit"}', 750) } } catch { }
+      if (-not $worker.WaitForExit(750)) {
+        try { $worker.Kill() } catch { }
+        try { [void]$worker.WaitForExit(1500) } catch { }
+      }
+    }
   }
+  if ($pipe) { try { $pipe.Dispose() } catch { } }
+  if ($worker) { try { $worker.Dispose() } catch { } }
+  $script:WorkerPipe = $null
   $script:Worker = $null
-  $script:DoubaoRead = $null
-  $script:HunyuanRead = $null
 }
 
 function Start-Worker {
-  if ($script:Worker -and -not $script:Worker.HasExited) { return }
+  if ($script:Worker -or $script:WorkerPipe) {
+    # 复用前先确认通道健康：EOF/超时/溢出后旧管道不可再用，必须收掉旧进程再重建。
+    if ($script:Worker -and -not $script:Worker.HasExited -and $script:WorkerPipe -and
+        -not $script:WorkerPipe.IsFaulted -and -not $script:WorkerPipe.IsEnded) { return }
+    Stop-Worker
+  }
   $psi = [System.Diagnostics.ProcessStartInfo]::new()
   $psi.RedirectStandardInput  = $true
   $psi.RedirectStandardOutput = $true
@@ -400,14 +415,12 @@ function Start-Worker {
     $psi.Arguments = '"' + (Join-Path $AppDir 'worker_doubao.mjs') + '"'
     $psi.EnvironmentVariables['VT_DOUBAO_KEY_NAME'] = [string]$script:Cfg.doubaoKeyName
     $readyTimeoutMs = 10000
-    $script:DoubaoRead = $null
   }
   elseif ($script:Cfg.engine -eq 'hunyuan') {
     $psi.FileName = Get-NodeExe
     $psi.Arguments = '"' + (Join-Path $AppDir 'worker_hunyuan.mjs') + '"'
     $psi.EnvironmentVariables['VT_HUNYUAN_KEY_NAME'] = [string]$script:Cfg.hunyuanKeyName
     $readyTimeoutMs = 10000
-    $script:HunyuanRead = $null
   }
   elseif ($script:Cfg.engine -eq 'qwen3') {
     $py = Get-PythonExe
@@ -429,14 +442,32 @@ function Start-Worker {
   }
 
   $script:Worker = [System.Diagnostics.Process]::Start($psi)
+  # 从进程启动的第一刻起就由后台线程持续排空 stdout。绝不能让 UI 线程等到“发完命令”才读：
+  # Windows 上 Node 写管道是同步的，单行 >4 KB 时没读者就会把 worker 事件循环连同 stdin 消费一起冻住。
+  try {
+    $script:WorkerPipe = New-WorkerPipe -Process $script:Worker
+  } catch {
+    Stop-Worker
+    throw "无法建立识别进程通信管道（引擎 $($script:Cfg.engine)）：$($_.Exception.Message)"
+  }
 
-  # 等 ready 行。注意：不能用 ReadLineAsync().Wait() ——
-  # 在 PowerShell 里 .Wait() 会和同步上下文互锁造成死锁（表现为脚本永久卡住）。
-  # 改用 ReadLineAsync + 轮询，安全且能设超时。
+  # 等 ready 行。readiness 与后续所有读取共用同一个后台泵，谁都不会再直接碰 StandardOutput。
   # Qwen3 首次要加载约 950MB 模型（实测 3.5 秒），SenseVoice 约 1.4 秒。
-  $task = $script:Worker.StandardOutput.ReadLineAsync()
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  while (-not $task.IsCompleted) {
+  $ready = $null
+  while ($true) {
+    $line = $null
+    $status = $script:WorkerPipe.ReadLine(50, [ref]$line)
+    if ($status -eq 0) { $ready = $line; break }
+    if ($status -eq 3) {
+      $reason = $script:WorkerPipe.LastError
+      Stop-Worker
+      throw "识别进程输出读取失败（引擎 $($script:Cfg.engine)）：$reason"
+    }
+    if ($status -eq 2) {
+      Stop-Worker
+      throw "识别进程未返回就绪信息（引擎 $($script:Cfg.engine)）"
+    }
     if ($script:Worker.HasExited) {
       Stop-Worker
       throw "识别进程启动即退出（引擎 $($script:Cfg.engine)）—— 请检查模型与依赖"
@@ -445,9 +476,7 @@ function Start-Worker {
       Stop-Worker
       throw "识别进程启动超时（$([int]($readyTimeoutMs/1000)) 秒，引擎 $($script:Cfg.engine)）"
     }
-    Start-Sleep -Milliseconds 50
   }
-  $ready = $task.Result
   if (-not $ready) {
     Stop-Worker
     throw "识别进程未返回就绪信息（引擎 $($script:Cfg.engine)）"
@@ -463,12 +492,15 @@ function Invoke-Recognition {
   $req = @{ id = $id; wav = $WavPath; lang = $script:Cfg.lang }
   if ($Vad) { $req.vad = $true }
   $json = $req | ConvertTo-Json -Compress
-  $script:Worker.StandardInput.WriteLine($json)
-  $script:Worker.StandardInput.Flush()
+  Send-WorkerLine -Line $json -TimeoutMs 5000
   $deadline = (Get-Date).AddSeconds($TimeoutSec)
   while ((Get-Date) -lt $deadline) {
-    $line = $script:Worker.StandardOutput.ReadLine()
-    if ($null -eq $line) { throw '识别进程意外退出' }
+    $line = $null
+    $waitMs = [Math]::Max(1, [Math]::Min(500, [int]($deadline - (Get-Date)).TotalMilliseconds))
+    $status = $script:WorkerPipe.ReadLine($waitMs, [ref]$line)
+    if ($status -eq 1) { continue }
+    if ($status -eq 3) { throw ('识别进程读取失败: ' + $script:WorkerPipe.LastError) }
+    if ($status -eq 2) { throw '识别进程意外退出' }
     if (-not $line.Trim()) { continue }
     try { $o = $line | ConvertFrom-Json } catch { continue }
     if ($o.PSObject.Properties.Name -contains 'ready') { continue }

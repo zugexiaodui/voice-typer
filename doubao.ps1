@@ -1,6 +1,6 @@
-# 豆包云端会话：UI 线程只轮询已完成的读取任务，网络工作在 Node worker 中。
+# 豆包云端会话：stdout 由 worker-pipe.ps1 的后台泵持续排空，UI 线程只从有界队列取已完成事件；
+# 音频发送走有界写队列 + 后台 writer，网络工作在 Node worker 中。
 $script:Doubao = $null
-$script:DoubaoRead = $null
 $script:DoubaoPumpBusy = $false
 $script:DoubaoTimer = $null
 
@@ -23,8 +23,8 @@ function New-DoubaoRequest {
 function Send-DoubaoCommand {
   param($Command)
   if (-not $script:Worker -or $script:Worker.HasExited) { throw '豆包通信进程已退出' }
-  $script:Worker.StandardInput.WriteLine(($Command | ConvertTo-Json -Depth 8 -Compress))
-  $script:Worker.StandardInput.Flush()
+  # 有界后台写：UI 最多等 5 秒，超时/管道故障都会抛出明确错误，不会永久卡住消息循环。
+  Send-WorkerLine -Line ($Command | ConvertTo-Json -Depth 8 -Compress) -TimeoutMs 5000
 }
 
 function Send-DoubaoAudio {
@@ -79,31 +79,56 @@ function Submit-DoubaoSegments {
   }
 }
 
+function Receive-DoubaoLines {
+  # 从桥队列取行并交给会话。WaitMs>0 时在 BudgetMs 内反复等后台泵入队，
+  # 用于进程退出后给 reader 一个有界排空窗口；WaitMs=0 时保持 UI 轮询不阻塞。
+  param($Session, [int]$MaxLines = 100, [int]$BudgetMs = 50, [int]$WaitMs = 0)
+  $slice = [Diagnostics.Stopwatch]::StartNew()
+  $status = 1
+  for ($i = 0; $i -lt $MaxLines; $i++) {
+    $line = $null
+    $status = $script:WorkerPipe.ReadLine($WaitMs, [ref]$line)
+    if ($status -eq 1) {
+      if ($WaitMs -le 0 -or $slice.ElapsedMilliseconds -ge $BudgetMs) { break }
+      continue
+    }
+    if ($status -ne 0) { return $status }
+    if ($line.Trim()) {
+      $event = $line | ConvertFrom-Json
+      [void](Receive-DoubaoEvent -Event $event)
+      if ($Session.Cancelled -or $Session.Done) { return $status }
+    }
+    if ($slice.ElapsedMilliseconds -ge $BudgetMs) { break }
+  }
+  return $status
+}
+
 function Update-DoubaoSession {
   if ($script:DoubaoPumpBusy -or -not $script:Doubao) { return }
   $script:DoubaoPumpBusy = $true
   try {
     $s = $script:Doubao
+    # 先消费已经到达/仍在后台泵里的结果，再发送音频：worker 写完 finished 后立刻退出时，
+    # 必须让最终结果优先于 HasExited/EOF，否则会把队列里的成功结果误判成通信失败。
+    $readStatus = Receive-DoubaoLines -Session $s -MaxLines 100 -BudgetMs 50
+    if ($readStatus -eq 3) { throw ('豆包通信进程读取失败：' + $script:WorkerPipe.LastError) }
+    if ($readStatus -eq 2 -and -not $s.Done -and -not $s.Cancelled) { throw '豆包通信进程意外退出' }
     if (-not $s.Cancelled -and -not $s.Done -and $s.Capture) {
       Send-DoubaoAudio -Data ($s.Capture.Drain())
     }
-    # 限制单次处理数量，避免大量响应饿死界面和热键。
-    for ($i = 0; $i -lt 100; $i++) {
-      if (-not $script:DoubaoRead) { $script:DoubaoRead = $script:Worker.StandardOutput.ReadLineAsync() }
-      if (-not $script:DoubaoRead.IsCompleted) { break }
-      $line = $script:DoubaoRead.GetAwaiter().GetResult()
-      $script:DoubaoRead = $null
-      if ($null -eq $line) {
-        if (-not $s.Done -and -not $s.Cancelled) { throw '豆包通信进程意外退出' }
-        break
-      }
-      if (-not $line.Trim()) { continue }
-      $event = $line | ConvertFrom-Json
-      Receive-DoubaoEvent -Event $event
-    }
   } catch {
-    $script:Doubao.Error = $_.Exception.Message
-    $script:Doubao.Done = $true
+    $s = $script:Doubao
+    $reason = $_.Exception.Message
+    # 读完队列与发送之间仍有竞态：进程可能已退出并写出 finished，但 reader 尚未入队。
+    # 给后台泵一个有界排空机会，只在错误路径付出这段等待（最多约 300ms / 1024 行）。
+    if ($s -and -not $s.Done -and -not $s.Cancelled -and $script:WorkerPipe) {
+      try { [void](Receive-DoubaoLines -Session $s -MaxLines 1024 -BudgetMs 300 -WaitMs 20) } catch { }
+    }
+    if ($s -and -not $s.Done) {
+      # 没有收到 finished/error：明确失败，保留已到达的最新文本，不把部分结果当成功。
+      $s.Error = $reason
+      $s.Done = $true
+    }
   } finally { $script:DoubaoPumpBusy = $false }
 }
 
@@ -242,6 +267,8 @@ function Stop-DoubaoDictation {
     Hide-Overlay
   } finally {
     try { Send-DoubaoCommand @{ cmd = 'cancel'; session = $s.Id } } catch { }
+    # 管道已坏/EOF 时旧 worker 无法再复用；当场收掉，下一次 Start-Worker 会重建。
+    if ($script:WorkerPipe -and ($script:WorkerPipe.IsFaulted -or $script:WorkerPipe.IsEnded)) { Stop-Worker }
     try { $s.Capture.Dispose() } catch { Say $_.Exception.Message Yellow }
     Unregister-CancelHotkey
     $script:Doubao = $null
@@ -265,6 +292,8 @@ function Invoke-DoubaoFileTest {
   $psi.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
   $psi.Environment['VT_DOUBAO_KEY_NAME'] = [string]$Config.doubaoKeyName
   $p = [Diagnostics.Process]::Start($psi)
+  try { $pipe = New-WorkerPipe -Process $p }
+  catch { try { $p.Kill() } catch { }; $p.Dispose(); throw }
   $errTask = $p.StandardError.ReadToEndAsync()
   $id = [guid]::NewGuid().ToString()
   $request = New-DoubaoRequest -Config $Config -Session $id -Command 'recognize'
@@ -273,15 +302,16 @@ function Invoke-DoubaoFileTest {
   $first = $null; $connected = $null; $text = ''; $sent = $false
   $oldBusy = $script:Busy; $script:Busy = $true
   try {
-    $read = $p.StandardOutput.ReadLineAsync()
     while ($clock.Elapsed.TotalSeconds -lt 45) {
       Invoke-DoubaoMessages
-      if (-not $read.IsCompleted) { Start-Sleep -Milliseconds 15; continue }
-      $line = $read.GetAwaiter().GetResult()
-      if ($null -eq $line) { throw '豆包测试进程已退出' }
+      $line = $null
+      $status = $pipe.ReadLine(20, [ref]$line)
+      if ($status -eq 1) { continue }
+      if ($status -eq 3) { throw ('豆包测试进程读取失败：' + $pipe.LastError) }
+      if ($status -eq 2) { throw '豆包测试进程已退出' }
       $e = $line | ConvertFrom-Json
       if ($e.event -eq 'ready' -and -not $sent) {
-        $p.StandardInput.WriteLine(($request | ConvertTo-Json -Depth 8 -Compress)); $p.StandardInput.Flush(); $sent = $true
+        $pipe.WriteLine(($request | ConvertTo-Json -Depth 8 -Compress), 5000); $sent = $true
       }
       if ($e.session -eq $id) {
         if ($e.event -eq 'error') { throw [string]$e.error }
@@ -292,13 +322,13 @@ function Invoke-DoubaoFileTest {
                  "`r`n（下面这句是软件内置样例音频 test.wav 的识别内容，用于证明识别可用，不是报错）`r`n识别结果：$text"
         }
       }
-      $read = $p.StandardOutput.ReadLineAsync()
     }
     throw '豆包测试超时'
   } finally {
     $script:Busy = $oldBusy
-    try { $p.StandardInput.WriteLine('{"cmd":"exit"}'); $p.StandardInput.Flush() } catch { }
-    if (-not $p.WaitForExit(1000)) { $p.Kill() }
+    try { $pipe.WriteLine('{"cmd":"exit"}', 750) } catch { }
+    if (-not $p.WaitForExit(1000)) { try { $p.Kill() } catch { } }
+    try { $pipe.Dispose() } catch { }
     $p.Dispose()
   }
 }
