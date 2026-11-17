@@ -363,6 +363,7 @@ function Get-Qwen3ModelDir {
 
 function Get-EngineLabel {
   if ($script:Cfg.engine -eq 'doubao') { return '豆包云端' }
+  if ($script:Cfg.engine -eq 'doubao-file') { return '豆包文件识别' }
   if ($script:Cfg.engine -eq 'hunyuan') { return '腾讯混元' }
   if ($script:Cfg.engine -eq 'qwen3') { return 'Qwen3-ASR-0.6B' }
   return 'SenseVoice'
@@ -415,6 +416,15 @@ function Start-Worker {
     $psi.Arguments = '"' + (Join-Path $AppDir 'worker_doubao.mjs') + '"'
     $psi.EnvironmentVariables['VT_DOUBAO_KEY_NAME'] = [string]$script:Cfg.doubaoKeyName
     $readyTimeoutMs = 10000
+  }
+  elseif ($script:Cfg.engine -eq 'doubao-file') {
+    # 整段提交给录音文件识别：不建 WebSocket，一次 HTTP 提交 + 轮询取结果。
+    $psi.FileName = Get-NodeExe
+    $psi.Arguments = '"' + (Join-Path $AppDir 'worker_doubao_file.mjs') + '"'
+    $psi.EnvironmentVariables['VT_DOUBAO_KEY_NAME'] = [string]$script:Cfg.doubaoKeyName
+    $psi.EnvironmentVariables['VT_DOUBAO_FILE_RESOURCE'] = [string]$script:Cfg.doubaoFileResourceId
+    $psi.EnvironmentVariables['VT_DOUBAO_FILE_TIMEOUT_MS'] = [string][int]$script:Cfg.doubaoFileTimeoutMs
+    $readyTimeoutMs = 15000
   }
   elseif ($script:Cfg.engine -eq 'hunyuan') {
     $psi.FileName = Get-NodeExe
@@ -494,36 +504,47 @@ function Invoke-Recognition {
   $json = $req | ConvertTo-Json -Compress
   Send-WorkerLine -Line $json -TimeoutMs 5000
   $deadline = (Get-Date).AddSeconds($TimeoutSec)
-  while ((Get-Date) -lt $deadline) {
-    $line = $null
-    $waitMs = [Math]::Max(1, [Math]::Min(500, [int]($deadline - (Get-Date)).TotalMilliseconds))
-    $status = $script:WorkerPipe.ReadLine($waitMs, [ref]$line)
-    if ($status -eq 1) { continue }
-    if ($status -eq 3) { throw ('识别进程读取失败: ' + $script:WorkerPipe.LastError) }
-    if ($status -eq 2) { throw '识别进程意外退出' }
-    if (-not $line.Trim()) { continue }
-    try { $o = $line | ConvertFrom-Json } catch { continue }
-    if ($o.PSObject.Properties.Name -contains 'ready') { continue }
-    if ($o.id -ne $id) { continue }
-    if ($o.ok) {
-      $segs = @()
-      if ($Vad -and $o.PSObject.Properties.Name -contains 'segments' -and $o.segments) {
-        foreach ($sg in $o.segments) {
-          # Closed：段落是否已确认说完（末尾那段为 false）。
-          # Node 版没有这个字段（靠"去掉最后一段"实现），缺失时默认 true 以保持兼容。
-          $closed = $true
-          if ($sg.PSObject.Properties.Name -contains 'closed') { $closed = [bool]$sg.closed }
-          $segs += [pscustomobject]@{ Text = [string]$sg.t; Dur = [double]$sg.dur; Closed = $closed }
+  # 文件识别要走网络和轮询，可能等十几秒。等待期间必须继续泵窗口消息，
+  # 否则悬浮窗"识别中…"会冻住、看起来像卡死（这正是之前流式收尾踩过的坑）。
+  # Busy 一起置位：泵消息会让悬浮按钮点击重入，必须挡住新的录音。
+  $pump = $script:Cfg.engine -eq 'doubao-file'
+  $oldBusy = $script:Busy
+  if ($pump) { $script:Busy = $true }
+  try {
+    while ((Get-Date) -lt $deadline) {
+      if ($pump) { try { Invoke-DoubaoMessages } catch { } }
+      $line = $null
+      $waitMs = [Math]::Max(1, [Math]::Min(500, [int]($deadline - (Get-Date)).TotalMilliseconds))
+      $status = $script:WorkerPipe.ReadLine($waitMs, [ref]$line)
+      if ($status -eq 1) { continue }
+      if ($status -eq 3) { throw ('识别进程读取失败: ' + $script:WorkerPipe.LastError) }
+      if ($status -eq 2) { throw '识别进程意外退出' }
+      if (-not $line.Trim()) { continue }
+      try { $o = $line | ConvertFrom-Json } catch { continue }
+      if ($o.PSObject.Properties.Name -contains 'ready') { continue }
+      if ($o.id -ne $id) { continue }
+      if ($o.ok) {
+        $segs = @()
+        if ($Vad -and $o.PSObject.Properties.Name -contains 'segments' -and $o.segments) {
+          foreach ($sg in $o.segments) {
+            # Closed：段落是否已确认说完（末尾那段为 false）。
+            # Node 版没有这个字段（靠"去掉最后一段"实现），缺失时默认 true 以保持兼容。
+            $closed = $true
+            if ($sg.PSObject.Properties.Name -contains 'closed') { $closed = [bool]$sg.closed }
+            $segs += [pscustomobject]@{ Text = [string]$sg.t; Dur = [double]$sg.dur; Closed = $closed }
+          }
         }
+        # 【务必统一返回 {Text, Segments} 对象】
+        # 以前不传 -Vad 时这里返回裸字符串，调用方写 $res.Text 就会静默拿到空值，
+        # 表现为"识别不出来内容"。返回类型不一致是这类 bug 的温床，不要再改回去。
+        return [pscustomobject]@{ Text = [string]$o.text; Segments = $segs }
       }
-      # 【务必统一返回 {Text, Segments} 对象】
-      # 以前不传 -Vad 时这里返回裸字符串，调用方写 $res.Text 就会静默拿到空值，
-      # 表现为"识别不出来内容"。返回类型不一致是这类 bug 的温床，不要再改回去。
-      return [pscustomobject]@{ Text = [string]$o.text; Segments = $segs }
+      throw "识别失败: $($o.error)"
     }
-    throw "识别失败: $($o.error)"
+    throw '识别超时'
+  } finally {
+    if ($pump) { $script:Busy = $oldBusy }
   }
-  throw '识别超时'
 }
 
 # ═══════════════════════ 收尾 AI 校验 ═══════════════════════
@@ -1053,7 +1074,8 @@ if ($EngineTest) {
   if ($script:Cfg.engine -eq 'qwen3') {
     Say '启动识别进程（Qwen3 首次需加载约 950MB 模型，实测约 4 秒）…' DarkGray
   } else {
-    Say '启动识别进程（SenseVoice 约 1.5 秒）…' DarkGray
+    $bootHint = if ($script:Cfg.engine -eq 'doubao-file') { '豆包文件识别，需联网' } else { 'SenseVoice 约 1.5 秒' }
+    Say ("启动识别进程（{0}）…" -f $bootHint) DarkGray
   }
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   try { Start-Worker } catch { Say ("启动失败: {0}" -f $_.Exception.Message) Red; exit 1 }
@@ -1066,25 +1088,28 @@ if ($EngineTest) {
   try { $t = (Invoke-Recognition -WavPath $wav -TimeoutSec 120).Text } catch { Say ("  失败: {0}" -f $_.Exception.Message) Red; Stop-Worker; exit 1 }
   Say ("  {0}   （{1:N0} ms）" -f $t, $sw.ElapsedMilliseconds) Green
 
-  # 2) VAD 识别
-  Say ''
-  Say '② VAD 切段识别:' White
-  $sw.Restart()
-  try { $r = Invoke-Recognition -WavPath $wav -TimeoutSec 120 -Vad } catch { Say ("  失败: {0}" -f $_.Exception.Message) Red; Stop-Worker; exit 1 }
-  $ms = $sw.ElapsedMilliseconds
-  Say ("  共 {0} 段，用时 {1:N0} ms" -f @($r.Segments).Count, $ms) Green
-  $i = 0
-  foreach ($sg in $r.Segments) {
-    $i++
-    Say ("    段{0}  {1:N2}s  closed={2}  「{3}」" -f $i, $sg.Dur, $sg.Closed, $sg.Text) Gray
-  }
-  if (@($r.Segments).Count -eq 0) { Say '    ⚠️ 没有切出任何段落' Yellow }
+  # 文件识别是整段转写，没有分段结果（worker 不返回 segments），这两步对它没有意义。
+  if ($script:Cfg.engine -ne 'doubao-file') {
+    # 2) VAD 识别
+    Say ''
+    Say '② VAD 切段识别:' White
+    $sw.Restart()
+    try { $r = Invoke-Recognition -WavPath $wav -TimeoutSec 120 -Vad } catch { Say ("  失败: {0}" -f $_.Exception.Message) Red; Stop-Worker; exit 1 }
+    $ms = $sw.ElapsedMilliseconds
+    Say ("  共 {0} 段，用时 {1:N0} ms" -f @($r.Segments).Count, $ms) Green
+    $i = 0
+    foreach ($sg in $r.Segments) {
+      $i++
+      Say ("    段{0}  {1:N2}s  closed={2}  「{3}」" -f $i, $sg.Dur, $sg.Closed, $sg.Text) Gray
+    }
+    if (@($r.Segments).Count -eq 0) { Say '    ⚠️ 没有切出任何段落' Yellow }
 
-  # 3) 完成段筛选（流式逻辑用的就是这个）
-  Say ''
-  Say '③ 可用于流式提交的段落（末尾正在说的不算）:' White
-  $done = @(Select-CompletedSegments -Segments $r.Segments)
-  Say ("  {0} 段: {1}" -f $done.Count, (($done | ForEach-Object { $_.Text }) -join '')) Cyan
+    # 3) 完成段筛选（流式逻辑用的就是这个）
+    Say ''
+    Say '③ 可用于流式提交的段落（末尾正在说的不算）:' White
+    $done = @(Select-CompletedSegments -Segments $r.Segments)
+    Say ("  {0} 段: {1}" -f $done.Count, (($done | ForEach-Object { $_.Text }) -join '')) Cyan
+  }
 
   Stop-Worker
   Say ''
@@ -1242,7 +1267,8 @@ function Start-Dictation {
     $script:recording = $true
     Register-CancelHotkey          # 录音期间才占用取消键（默认 Esc）
 
-    if ($script:Cfg.streaming) {
+    # 文件识别引擎只能在录音结束后整段提交，不能边录边出字。
+    if ($script:Cfg.streaming -and $script:Cfg.engine -ne 'doubao-file') {
       $script:Streaming = [pscustomobject]@{
         Start         = Get-Date
         Text          = ''    # 已上屏的累计文字
@@ -1391,7 +1417,12 @@ function Stop-Dictation {
     # 非流式路径：直接整段识别，不用 VAD。
     # VAD 切句会在句子中间断开，且会吞掉句首的软起音（实测「我虽然觉得可以了」
     # 被切成「觉得可以了」）。整段识别上下文最完整，准确率明显更好。
-    $res = Invoke-Recognition -WavPath $script:RecFile
+    # 豆包文件识别要等云端排队+转写，超时按 doubaoFileTimeoutMs 给足；其余引擎沿用 120 秒。
+    $recTimeout = 120
+    if ($script:Cfg.engine -eq 'doubao-file') {
+      $recTimeout = [Math]::Max(30, [int]([double]$script:Cfg.doubaoFileTimeoutMs / 1000) + 15)
+    }
+    $res = Invoke-Recognition -WavPath $script:RecFile -TimeoutSec $recTimeout
     $sw.Stop()
     $text = [string]$res.Text
 

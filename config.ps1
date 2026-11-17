@@ -61,6 +61,7 @@ $script:DefaultConfig = [ordered]@{
   #  qwen3      : 慢约 7 倍（RTF≈0.25），本地，52 语言+22 方言，支持热词偏置
   #               适合高精度场景 / 多语言 / 长文整理
   #  doubao     : 云端 API，一句话 / 实时识别，无需本地模型，录音将上传且可能计费
+  #  doubao-file: 云端录音文件识别，说完后整段转写（标点更完整），无需本地模型
   #  hunyuan    : 腾讯混元云端，录音仅在内存中，不落盘
   engine        = 'sensevoice'
   qwen3ModelDir = ''                 # 留空则自动在 voice-typer\models\ 下查找
@@ -74,6 +75,9 @@ $script:DefaultConfig = [ordered]@{
   doubaoHotwords    = ''             # 逗号/顿号分隔
   doubaoEndWindowMs = 800            # 静音判句阈值，300~5000 ms
   doubaoTimeoutMs   = 15000          # 停止发送后等待最终结果的超时，ms
+  # ── 豆包录音文件识别（engine = doubao-file）──
+  doubaoFileResourceId = 'volc.seedasr.auc' # 录音文件识别模型资源；标准版 2.0
+  doubaoFileTimeoutMs  = 120000             # 提交后等待整段结果的时限，ms
 
   # ── 腾讯混元云端识别（TokenHub；只保存凭证引用名称，音频仅在内存中发送）──
   hunyuanModel     = 'hy-asr-3.0-preview' # TokenHub 模型名

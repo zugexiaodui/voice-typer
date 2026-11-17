@@ -273,6 +273,7 @@ function Show-SettingsDialog {
     'sensevoice|SenseVoice —— 快（推荐日常）',
     'qwen3|Qwen3-ASR-0.6B —— 准（多语言，慢约7倍）',
     'doubao|豆包云端 —— 联网识别，无需本地模型',
+    'doubao-file|豆包文件识别 —— 说完整段转写，标点完整（联网）',
     'hunyuan|腾讯混元 —— 云端识别，纯内存不落盘'
   ))
   foreach ($i in 0..($cbEngine.Items.Count - 1)) {
@@ -479,17 +480,26 @@ function Show-SettingsDialog {
   $updateEngineControls = {
       $selectedEngine = $cbEngine.SelectedItem.ToString().Split('|')[0]
       $isDoubao = $selectedEngine -eq 'doubao'
+      $isDoubaoFile = $selectedEngine -eq 'doubao-file'
       $isHunyuan = $selectedEngine -eq 'hunyuan'
-      $isCloudEngine = $isDoubao -or $isHunyuan
+      $isCloudEngine = $isDoubao -or $isHunyuan -or $isDoubaoFile
       $isRealtime = $cbDoubaoMode.SelectedIndex -eq 1
       $grid.SuspendLayout()
       try {
         foreach ($control in @($cbLang, $numThreads, $numIdle)) { $control.Enabled = -not $isCloudEngine }
         Set-SettingsRowVisible -Control $tbHotwords -Visible ($selectedEngine -eq 'qwen3')
-        foreach ($control in $doubaoRows) { Set-SettingsRowVisible -Control $control -Visible $isDoubao }
+        # 文件识别与流式豆包共用密钥，但不共用模式/计费通道，只显示密钥那一行。
+        foreach ($control in $doubaoRows) {
+          $visible = $isDoubao -or ($isDoubaoFile -and $control -eq $tbDoubaoKey)
+          Set-SettingsRowVisible -Control $control -Visible $visible
+        }
         foreach ($control in $hunyuanRows) { Set-SettingsRowVisible -Control $control -Visible $isHunyuan }
         $ckDoubaoNonstream.Enabled = $isDoubao -and $isRealtime
-        if ($isDoubao) {
+        if ($isDoubaoFile) {
+          $ckStream.Text = '说完后整段识别并粘贴（标点完整）'
+          $ckStream.Enabled = $false
+          $streamHint.Text = '录音文件识别为整段转写，不支持边说要边上屏'
+        } elseif ($isDoubao) {
           $ckStream.Text = '边说边上屏（仅提交已确定分句）'
           $ckStream.Enabled = $isRealtime -and -not $ckCorrect.Checked -and $ckPaste.Checked
           $streamHint.Text = if ($ckCorrect.Checked) {

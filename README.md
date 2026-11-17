@@ -29,13 +29,14 @@
 
 ### 识别
 
-设置里随时切换引擎。两个**本地**、两个**云端**：
+设置里随时切换引擎。两个**本地**、三个**云端**：
 
 | 引擎 | 位置 | 速度（6s 音频） | 语言 | 热词 | 音频是否出本机 |
 |---|---|---|---|---|---|
 | `SenseVoiceSmall`（默认） | 本地 | 约 0.3 秒 | 中/英/日/韩/粤 | ✗ | 否 |
 | `Qwen3-ASR-0.6B` | 本地 | 约 1.2 秒 | 52 种 + 22 种中文方言 | ✓ | 否 |
 | `豆包云端` | 云端 | 约 1.4~2.8 秒 | 多语种 | ✓ | **是** |
+| `豆包文件识别` | 云端 | 约 1.8~3 秒 | 多语种 | ✗ | **是** |
 | `腾讯混元` | 云端 | 约 1.8~2.5 秒 | 中文为主 | ✗ | **是** |
 
 **本地引擎**
@@ -47,6 +48,11 @@
 **云端引擎（可选，默认不启用）**
 
 - `豆包云端`：WebSocket 流式推送麦克风音频，支持「一句话识别」和「实时识别 + 句末二遍识别」
+- `豆包文件识别`：**整段识别**。录音结束后把整段 WAV 以 base64 交给「录音文件识别」接口
+  （`/api/v3/auc/bigmodel/submit` 提交 + `/query` 轮询），**标点最完整**，
+  适合一段话说完再要成稿；不支持边说要边上屏（设置里流式开关会自动置灰）。
+  资源 ID 与超时可用 `settings.json` 的 `doubaoFileResourceId`（默认 `volc.seedasr.auc`）、
+  `doubaoFileTimeoutMs`（默认 120000）调整
 - `腾讯混元`：**整段识别**。录音全程走 `waveIn` 内存队列，**不写任何磁盘文件**，
   停止录音后一次性把 PCM 以 base64 交给 TokenHub（`sync_transcribe` 的 `data` 字段）
 - 两者的识别结果都可继续走下面可选的「收尾 AI 校验」
@@ -316,13 +322,16 @@ voice-typer/
 两个云端引擎的采集与传输路径不同：
 
 ```
-豆包云端：  麦克风 → waveIn 内存队列 → 每 200ms 一包 → WebSocket → 流式/整句结果
-腾讯混元：  麦克风 → waveIn 内存队列 → 停止录音后一次性 base64 → HTTPS sync_transcribe
-本地引擎：  麦克风 → MCI 临时 WAV → worker 进程读文件 → 本地 ONNX 推理
+豆包云端：    麦克风 → waveIn 内存队列 → 每 200ms 一包 → WebSocket → 流式/整句结果
+豆包文件识别：麦克风 → MCI 临时 WAV → 停止后整段 base64 → HTTPS submit → 轮询 query
+腾讯混元：    麦克风 → waveIn 内存队列 → 停止录音后一次性 base64 → HTTPS sync_transcribe
+本地引擎：    麦克风 → MCI 临时 WAV → worker 进程读文件 → 本地 ONNX 推理
 ```
 
 - 豆包与混元都用 `audio-capture.cs` 里的 `VTPcmRecorder`（Windows `waveIn`），
   PCM 只存在于内存队列，**不创建音频文件**。
+- 豆包文件识别走的是通用「录音文件 → 识别」链路，和本地引擎一样会产生临时 WAV；
+  官方文档写 `audio.url` 必填，但实测 `audio.data`（裸 base64）同样被接受，所以不需要对象存储。
 - 混元走 `sync_transcribe` 的 `data` 字段，**裸 base64，不能加 `data:` 前缀**
   （加了前缀会把音频弄坏、返回空文本）。
 - 混元的异步接口 `async_create` **只接受 `input_url`**，不支持 `data`，
@@ -422,7 +431,7 @@ voice-typer/
 
 ```powershell
 # worker 协议与归一化（Node）
-node --test .\doubao-worker.test.mjs .\hunyuan-worker.test.mjs
+node --test .\doubao-worker.test.mjs .\hunyuan-worker.test.mjs .\doubao-file-worker.test.mjs
 
 # stdio 桥生产路径（PowerShell + C# 桥 + 本地 mock worker）
 pwsh -NoProfile -File .\worker-pipe.test.ps1
