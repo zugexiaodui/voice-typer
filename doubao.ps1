@@ -36,11 +36,6 @@ function Send-DoubaoAudio {
   }
 }
 
-function Get-DoubaoConfirmedText {
-  param($Segments)
-  return ((@($Segments) | Where-Object { $_.definite } | ForEach-Object { [string]$_.text }) -join '')
-}
-
 function Receive-DoubaoEvent {
   param($Event)
   $s = $script:Doubao
@@ -281,7 +276,7 @@ function Stop-DoubaoDictation {
   }
 }
 
-function Invoke-DoubaoFileTest {
+function Invoke-DoubaoStreamingTest {
   param($Config)
   $psi = [Diagnostics.ProcessStartInfo]::new()
   $psi.FileName = Get-NodeExe
@@ -333,4 +328,4 @@ function Invoke-DoubaoFileTest {
   }
 }
 
-$script:OnDoubaoTest = { param($Config) Invoke-DoubaoFileTest -Config $Config }
+$script:OnDoubaoStreamingTest = { param($Config) Invoke-DoubaoStreamingTest -Config $Config }

@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { FileRecognitionWorker } from './worker_doubao_file.mjs';
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vt-doubao-file-'));
+test.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
 const wavPath = path.join(tmpDir, 'sample.wav');
 const wavBytes = Buffer.alloc(4800, 7);
 fs.writeFileSync(wavPath, wavBytes);

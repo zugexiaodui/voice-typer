@@ -10,6 +10,7 @@
     -NoPaste        只显示识别结果，不自动粘贴
     -Test           自检后退出
     -HotkeyTest     只测试热键，8 秒后退出
+    -DoubaoFileTest <WAV 路径> 只验证豆包录音文件接口，不录音、不粘贴
 #>
 [CmdletBinding()]
 param(
@@ -22,6 +23,7 @@ param(
   [switch]$StreamTest,       # 用真实音频验证流式提交逻辑
   [switch]$CorrectTest,      # 验证收尾 AI 校验（真实调用 API）
   [switch]$DoubaoTest,       # test.wav 云端测试，不采集麦克风、不粘贴
+  [string]$DoubaoFileTest,   # 指定 WAV 验证录音文件识别，不修改已保存的引擎
   [ValidateSet('sentence','realtime')][string]$DoubaoMode = 'sentence',
   [switch]$HunyuanTest,      # test.wav 混元连通性测试（只读本地文件，不上屏）
   [switch]$EngineTest,       # 验证当前配置的识别引擎（启动+VAD+识别）
@@ -174,7 +176,7 @@ if ($SettingsOnly) {
 
 # ═══════════════════════ 单实例保护 ═══════════════════════
 # 没有这道检查的话，重复启动会静默失败（热键被占用），用户看不到任何反馈。
-if (-not $Test -and -not $HotkeyTest -and -not $StreamTest -and -not $SettingsOnly -and -not $CorrectTest -and -not $EngineTest -and -not $DoubaoTest -and -not $HunyuanTest) {
+if (-not $Test -and -not $HotkeyTest -and -not $StreamTest -and -not $SettingsOnly -and -not $CorrectTest -and -not $EngineTest -and -not $DoubaoTest -and -not $DoubaoFileTest -and -not $HunyuanTest) {
   $script:SingleMutex = [System.Threading.Mutex]::new($false, 'Global\voice-typer-single-instance')
   if (-not $script:SingleMutex.WaitOne(0)) {
     Write-Host ''
@@ -362,7 +364,7 @@ function Get-Qwen3ModelDir {
 }
 
 function Get-EngineLabel {
-  if ($script:Cfg.engine -eq 'doubao') { return '豆包云端' }
+  if ($script:Cfg.engine -eq 'doubao') { return '豆包流式识别' }
   if ($script:Cfg.engine -eq 'doubao-file') { return '豆包文件识别' }
   if ($script:Cfg.engine -eq 'hunyuan') { return '腾讯混元' }
   if ($script:Cfg.engine -eq 'qwen3') { return 'Qwen3-ASR-0.6B' }
@@ -496,6 +498,10 @@ function Start-Worker {
 
 function Invoke-Recognition {
   param([string]$WavPath, [int]$TimeoutSec = 120, [switch]$Vad)
+  # 文件识别需等待云端排队和转写；在 worker 自身的超时之外留出管道收尾时间。
+  if ($script:Cfg.engine -eq 'doubao-file' -and -not $PSBoundParameters.ContainsKey('TimeoutSec')) {
+    $TimeoutSec = [Math]::Max(30, [int]([double]$script:Cfg.doubaoFileTimeoutMs / 1000) + 15)
+  }
   Start-Worker
   $script:Mid++
   $id = $script:Mid
@@ -777,8 +783,24 @@ function Register-AllHotkeys {
 }
 
 # ═══════════════════════ 自检 ═══════════════════════
+if ($DoubaoFileTest) {
+  $script:Cfg.engine = 'doubao-file'
+  try {
+    $wav = Get-Item -LiteralPath $DoubaoFileTest
+    if ($wav -isnot [System.IO.FileInfo]) { throw '请指定一个本地 WAV 文件' }
+    Say ("验证豆包录音文件识别（资源：{0}，可能产生文件识别费用）…" -f $script:Cfg.doubaoFileResourceId) Cyan
+    $result = Invoke-Recognition -WavPath $wav.FullName
+    if ([string]::IsNullOrWhiteSpace($result.Text)) { throw '接口已返回，但未识别到语音；请用含有清晰语音的 WAV 重试' }
+    Say ('文件识别成功：' + $result.Text) Green
+    exit 0
+  } catch {
+    Say ('豆包文件识别验证失败：' + $_.Exception.Message) Red
+    exit 1
+  } finally { Stop-Worker }
+}
+
 if ($DoubaoTest) {
-  try { Say (Invoke-DoubaoFileTest -Config $script:Cfg) Green; exit 0 }
+  try { Say (Invoke-DoubaoStreamingTest -Config $script:Cfg) Green; exit 0 }
   catch { Say ('豆包测试失败：' + $_.Exception.Message) Red; exit 1 }
 }
 
@@ -814,7 +836,7 @@ if ($Test) {
 
   if ($script:Cfg.engine -eq 'doubao') {
     Say '测试豆包云端识别…' DarkGray
-    try { Say (Invoke-DoubaoFileTest -Config $script:Cfg) Green }
+    try { Say (Invoke-DoubaoStreamingTest -Config $script:Cfg) Green }
     catch { Say ("豆包测试失败: {0}" -f $_.Exception.Message) Red; exit 1 }
   } elseif ($script:Cfg.engine -eq 'hunyuan') {
     Say '测试腾讯混元识别…' DarkGray
@@ -1049,7 +1071,7 @@ if ($EngineTest) {
   Say ("引擎: {0}" -f (Get-EngineLabel)) Green
   if ($script:Cfg.engine -eq 'doubao') {
     Say ("模式: {0}   二遍识别: {1}   资源: {2}" -f $script:Cfg.doubaoMode, $script:Cfg.doubaoNonstream, $script:Cfg.doubaoResourceId) DarkGray
-    try { Say (Invoke-DoubaoFileTest -Config $script:Cfg) Green; Say '引擎验证完成' Cyan; exit 0 }
+    try { Say (Invoke-DoubaoStreamingTest -Config $script:Cfg) Green; Say '引擎验证完成' Cyan; exit 0 }
     catch { Say ("验证失败: {0}" -f $_.Exception.Message) Red; exit 1 }
   }
   if ($script:Cfg.engine -eq 'hunyuan') {
@@ -1085,7 +1107,7 @@ if ($EngineTest) {
   Say ''
   Say '① 整段识别:' White
   $sw.Restart()
-  try { $t = (Invoke-Recognition -WavPath $wav -TimeoutSec 120).Text } catch { Say ("  失败: {0}" -f $_.Exception.Message) Red; Stop-Worker; exit 1 }
+  try { $t = (Invoke-Recognition -WavPath $wav).Text } catch { Say ("  失败: {0}" -f $_.Exception.Message) Red; Stop-Worker; exit 1 }
   Say ("  {0}   （{1:N0} ms）" -f $t, $sw.ElapsedMilliseconds) Green
 
   # 文件识别是整段转写，没有分段结果（worker 不返回 segments），这两步对它没有意义。
@@ -1417,12 +1439,7 @@ function Stop-Dictation {
     # 非流式路径：直接整段识别，不用 VAD。
     # VAD 切句会在句子中间断开，且会吞掉句首的软起音（实测「我虽然觉得可以了」
     # 被切成「觉得可以了」）。整段识别上下文最完整，准确率明显更好。
-    # 豆包文件识别要等云端排队+转写，超时按 doubaoFileTimeoutMs 给足；其余引擎沿用 120 秒。
-    $recTimeout = 120
-    if ($script:Cfg.engine -eq 'doubao-file') {
-      $recTimeout = [Math]::Max(30, [int]([double]$script:Cfg.doubaoFileTimeoutMs / 1000) + 15)
-    }
-    $res = Invoke-Recognition -WavPath $script:RecFile -TimeoutSec $recTimeout
+    $res = Invoke-Recognition -WavPath $script:RecFile
     $sw.Stop()
     $text = [string]$res.Text
 

@@ -272,8 +272,8 @@ function Show-SettingsDialog {
   [void]$cbEngine.Items.AddRange(@(
     'sensevoice|SenseVoice —— 快（推荐日常）',
     'qwen3|Qwen3-ASR-0.6B —— 准（多语言，慢约7倍）',
-    'doubao|豆包云端 —— 联网识别，无需本地模型',
-    'doubao-file|豆包文件识别 —— 说完整段转写，标点完整（联网）',
+    'doubao|豆包流式识别 —— 边录边传，可选整句或实时预览',
+    'doubao-file|豆包文件识别 —— 停录后上传整段（独立计费）',
     'hunyuan|腾讯混元 —— 云端识别，纯内存不落盘'
   ))
   foreach ($i in 0..($cbEngine.Items.Count - 1)) {
@@ -291,7 +291,7 @@ function Show-SettingsDialog {
   $cbDoubaoMode.DropDownStyle = 'DropDownList'
   [void]$cbDoubaoMode.Items.AddRange(@('sentence|一句话识别：说完返回整句', 'realtime|实时识别：说话时预览文字'))
   $cbDoubaoMode.SelectedIndex = if ($Config.doubaoMode -eq 'realtime') { 1 } else { 0 }
-  AddRow '豆包识别模式' $cbDoubaoMode '两种模式均边录边传；实时模式的临时文字可能修订'
+  AddRow '豆包识别模式' $cbDoubaoMode '两种模式都边录边传。一句话模式返回稳定分句；实时预览可能更新'
 
   $ckDoubaoNonstream = [System.Windows.Forms.CheckBox]::new()
   $ckDoubaoNonstream.Text = '句末音频二遍识别'
@@ -305,7 +305,7 @@ function Show-SettingsDialog {
     'volc.seedasr.sauc.concurrent|模型 2.0 · 并发版（包月并发，企业专用）'
   ))
   $cbDoubaoResource.SelectedIndex = if ($Config.doubaoResourceId -eq 'volc.seedasr.sauc.concurrent') { 1 } else { 0 }
-  AddRow '豆包计费通道' $cbDoubaoResource '固定选「小时版」即可；切换一句话/实时模式无需改此项'
+  AddRow '豆包计费通道' $cbDoubaoResource '按已开通的流式资源选择；切换一句话或实时模式无需修改'
 
   $tbDoubaoKey = [System.Windows.Forms.TextBox]::new()
   $tbDoubaoKey.Text = [string]$Config.doubaoKeyName
@@ -325,24 +325,23 @@ function Show-SettingsDialog {
   $numDoubaoTimeout.Value = [Math]::Max(1000, [Math]::Min(120000, [int]$Config.doubaoTimeoutMs))
   AddRow '豆包收尾超时(ms)' $numDoubaoTimeout '停止发送音频后等待最终结果的时限，不限制录音时长'
 
-  # 主程序可注册 OnDoubaoTest($config)：接收未保存配置、负责异步等待和 UI 消息泵，返回状态文字。
+  # 主程序可注册 OnDoubaoStreamingTest($config)：接收未保存配置、负责异步等待和 UI 消息泵，返回状态文字。
   # 此界面不启动录音、不处理凭证，也不保存测试时输入的设置。
   $btnDoubaoTest = [System.Windows.Forms.Button]::new()
-  $btnDoubaoTest.Text = '测试豆包连接'
-  $btnDoubaoTest.Enabled = [bool]$script:OnDoubaoTest
+  $btnDoubaoTest.Text = '测试豆包流式识别'
+  $btnDoubaoTest.Enabled = [bool]$script:OnDoubaoStreamingTest
   AddRow '' $btnDoubaoTest '使用内置测试音频验证；测试结果不会粘贴到其他程序'
 
   function Get-DoubaoSettingsFromControls {
-    $settings = Get-Config
-    $settings.engine = 'doubao'
-    $settings.doubaoMode = $cbDoubaoMode.SelectedItem.ToString().Split('|')[0]
-    $settings.doubaoNonstream = [bool]$ckDoubaoNonstream.Checked
-    $settings.doubaoResourceId = $cbDoubaoResource.SelectedItem.ToString().Split('|')[0]
-    $settings.doubaoKeyName = $tbDoubaoKey.Text.Trim()
-    $settings.doubaoHotwords = $tbDoubaoHotwords.Text.Trim()
-    $settings.doubaoEndWindowMs = [int]$numDoubaoEnd.Value
-    $settings.doubaoTimeoutMs = [int]$numDoubaoTimeout.Value
-    return $settings
+    return @{
+      doubaoMode = $cbDoubaoMode.SelectedItem.ToString().Split('|')[0]
+      doubaoNonstream = [bool]$ckDoubaoNonstream.Checked
+      doubaoResourceId = $cbDoubaoResource.SelectedItem.ToString().Split('|')[0]
+      doubaoKeyName = $tbDoubaoKey.Text.Trim()
+      doubaoHotwords = $tbDoubaoHotwords.Text.Trim()
+      doubaoEndWindowMs = [int]$numDoubaoEnd.Value
+      doubaoTimeoutMs = [int]$numDoubaoTimeout.Value
+    }
   }
 
   # 凭证引用应是环境变量名，避免误把常见 UUID 格式的 API Key 保存进 settings.json。
@@ -355,13 +354,13 @@ function Show-SettingsDialog {
         [System.Windows.Forms.MessageBox]::Show('请填写密钥的环境变量／凭证引用名称，例如 DOUBAO_API_KEY；不要填写实际密钥。', '豆包连接测试', 'OK', 'Warning') | Out-Null
         return
       }
-      if (-not $script:OnDoubaoTest) { return }
+      if (-not $script:OnDoubaoStreamingTest) { return }
       $btnDoubaoTest.Enabled = $false
       $btnSave.Enabled = $false
       $lblState.ForeColor = [System.Drawing.Color]::DimGray
       $lblState.Text = '正在测试豆包服务，请稍候…'
       try {
-        $status = & $script:OnDoubaoTest (Get-DoubaoSettingsFromControls)
+        $status = & $script:OnDoubaoStreamingTest (Get-DoubaoSettingsFromControls)
         if (-not $form.IsDisposed) { $lblState.Text = [string]$status }
       } catch {
         if (-not $form.IsDisposed) {
@@ -370,7 +369,7 @@ function Show-SettingsDialog {
         }
       } finally {
         if (-not $form.IsDisposed) {
-          $btnDoubaoTest.Enabled = [bool]$script:OnDoubaoTest
+          $btnDoubaoTest.Enabled = [bool]$script:OnDoubaoStreamingTest
           $btnSave.Enabled = $true
         }
       }
@@ -474,8 +473,8 @@ function Show-SettingsDialog {
 
   # 模式与粘贴策略分别设置；切换引擎或模式只改变控件可用性，不改写已选开关。
   $streamHint = $grid.GetControlFromPosition(2, $grid.GetPositionFromControl($ckStream).Row)
-  $doubaoRows = @($cbDoubaoMode, $ckDoubaoNonstream, $cbDoubaoResource, $tbDoubaoKey,
-                  $tbDoubaoHotwords, $numDoubaoEnd, $numDoubaoTimeout, $btnDoubaoTest)
+  $doubaoStreamRows = @($cbDoubaoMode, $cbDoubaoResource, $tbDoubaoHotwords,
+                        $numDoubaoEnd, $numDoubaoTimeout, $btnDoubaoTest)
   $hunyuanRows = @($tbHunyuanModel, $tbHunyuanKey, $numHunyuanTimeout, $lblHunyuanInfo, $btnHunyuanTest)
   $updateEngineControls = {
       $selectedEngine = $cbEngine.SelectedItem.ToString().Split('|')[0]
@@ -488,24 +487,17 @@ function Show-SettingsDialog {
       try {
         foreach ($control in @($cbLang, $numThreads, $numIdle)) { $control.Enabled = -not $isCloudEngine }
         Set-SettingsRowVisible -Control $tbHotwords -Visible ($selectedEngine -eq 'qwen3')
-        # 文件识别与流式豆包共用密钥，但不共用模式/计费通道，只显示密钥那一行。
-        foreach ($control in $doubaoRows) {
-          $visible = $isDoubao -or ($isDoubaoFile -and $control -eq $tbDoubaoKey)
-          Set-SettingsRowVisible -Control $control -Visible $visible
-        }
+        foreach ($control in $doubaoStreamRows) { Set-SettingsRowVisible -Control $control -Visible $isDoubao }
+        Set-SettingsRowVisible -Control $tbDoubaoKey -Visible ($isDoubao -or $isDoubaoFile)
+        Set-SettingsRowVisible -Control $ckDoubaoNonstream -Visible ($isDoubao -and $isRealtime)
         foreach ($control in $hunyuanRows) { Set-SettingsRowVisible -Control $control -Visible $isHunyuan }
-        $ckDoubaoNonstream.Enabled = $isDoubao -and $isRealtime
-        if ($isDoubaoFile) {
-          $ckStream.Text = '说完后整段识别并粘贴（标点完整）'
-          $ckStream.Enabled = $false
-          $streamHint.Text = '录音文件识别为整段转写，不支持边说要边上屏'
-        } elseif ($isDoubao) {
+        # 文件识别不支持逐句上屏；一句话模式沿用已有的粘贴行为，但不开放开关。
+        Set-SettingsRowVisible -Control $ckStream -Visible (-not ($isDoubaoFile -or ($isDoubao -and -not $isRealtime)))
+        if ($isDoubao) {
           $ckStream.Text = '边说边上屏（仅提交已确定分句）'
           $ckStream.Enabled = $isRealtime -and -not $ckCorrect.Checked -and $ckPaste.Checked
           $streamHint.Text = if ($ckCorrect.Checked) {
             'AI 校验开启：预览后整段校验、一次粘贴；此开关暂不生效'
-          } elseif (-not $isRealtime) {
-            '一句话模式说完后粘贴；切到实时模式可预览并逐句上屏'
           } else {
             '仅控制粘贴时机；关闭后仍可在悬浮窗显示临时识别结果'
           }
@@ -775,10 +767,8 @@ function Show-SettingsDialog {
       $newCfg.correctFillers  = $tbFillers.Text.Trim()
       $newCfg.engine          = $cbEngine.SelectedItem.ToString().Split('|')[0]
       $newCfg.qwen3Hotwords   = $tbHotwords.Text.Trim()
-      $doubaoSettings = Get-DoubaoSettingsFromControls
-      foreach ($key in @('doubaoMode', 'doubaoNonstream', 'doubaoResourceId', 'doubaoKeyName',
-                         'doubaoHotwords', 'doubaoEndWindowMs', 'doubaoTimeoutMs')) {
-        $newCfg[$key] = $doubaoSettings[$key]
+      foreach ($entry in (Get-DoubaoSettingsFromControls).GetEnumerator()) {
+        $newCfg[$entry.Key] = $entry.Value
       }
       $hunyuanSettings = Get-HunyuanSettingsFromControls
       foreach ($key in @('hunyuanModel', 'hunyuanKeyName', 'hunyuanTimeoutMs')) {
